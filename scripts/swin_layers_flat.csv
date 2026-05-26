@@ -1,0 +1,155 @@
+idx,kind,stage,block,role,params,shape,apb,name
+0,Conv2d,-1,-1,first,4704,"(96, 3, 4, 4)",SKIP_NON_LINEAR,patch_embed.proj
+1,LayerNorm,-1,-1,first,192,"(96,)",SKIP_NON_LINEAR,patch_embed.norm
+2,LayerNorm,0,0,norm,192,"(96,)",SKIP_NON_LINEAR,layers.0.blocks.0.norm1
+3,Linear,0,0,attn_qkv,27936,"(288, 96)",APB_TARGET,layers.0.blocks.0.attn.qkv
+4,Linear,0,0,attn_proj,9312,"(96, 96)",APB_TARGET,layers.0.blocks.0.attn.proj
+5,LayerNorm,0,0,norm,192,"(96,)",SKIP_NON_LINEAR,layers.0.blocks.0.norm2
+6,Linear,0,0,mlp_fc1,37248,"(384, 96)",APB_TARGET,layers.0.blocks.0.mlp.fc1
+7,Linear,0,0,mlp_fc2,36960,"(96, 384)",APB_TARGET,layers.0.blocks.0.mlp.fc2
+8,LayerNorm,0,1,norm,192,"(96,)",SKIP_NON_LINEAR,layers.0.blocks.1.norm1
+9,Linear,0,1,attn_qkv,27936,"(288, 96)",APB_TARGET,layers.0.blocks.1.attn.qkv
+10,Linear,0,1,attn_proj,9312,"(96, 96)",APB_TARGET,layers.0.blocks.1.attn.proj
+11,LayerNorm,0,1,norm,192,"(96,)",SKIP_NON_LINEAR,layers.0.blocks.1.norm2
+12,Linear,0,1,mlp_fc1,37248,"(384, 96)",APB_TARGET,layers.0.blocks.1.mlp.fc1
+13,Linear,0,1,mlp_fc2,36960,"(96, 384)",APB_TARGET,layers.0.blocks.1.mlp.fc2
+14,LayerNorm,1,-1,norm,768,"(384,)",SKIP_NON_LINEAR,layers.1.downsample.norm
+15,Linear,1,-1,downsample,73728,"(192, 384)",SKIP_BY_RULE,layers.1.downsample.reduction
+16,LayerNorm,1,0,norm,384,"(192,)",SKIP_NON_LINEAR,layers.1.blocks.0.norm1
+17,Linear,1,0,attn_qkv,111168,"(576, 192)",APB_TARGET,layers.1.blocks.0.attn.qkv
+18,Linear,1,0,attn_proj,37056,"(192, 192)",APB_TARGET,layers.1.blocks.0.attn.proj
+19,LayerNorm,1,0,norm,384,"(192,)",SKIP_NON_LINEAR,layers.1.blocks.0.norm2
+20,Linear,1,0,mlp_fc1,148224,"(768, 192)",APB_TARGET,layers.1.blocks.0.mlp.fc1
+21,Linear,1,0,mlp_fc2,147648,"(192, 768)",APB_TARGET,layers.1.blocks.0.mlp.fc2
+22,LayerNorm,1,1,norm,384,"(192,)",SKIP_NON_LINEAR,layers.1.blocks.1.norm1
+23,Linear,1,1,attn_qkv,111168,"(576, 192)",APB_TARGET,layers.1.blocks.1.attn.qkv
+24,Linear,1,1,attn_proj,37056,"(192, 192)",APB_TARGET,layers.1.blocks.1.attn.proj
+25,LayerNorm,1,1,norm,384,"(192,)",SKIP_NON_LINEAR,layers.1.blocks.1.norm2
+26,Linear,1,1,mlp_fc1,148224,"(768, 192)",APB_TARGET,layers.1.blocks.1.mlp.fc1
+27,Linear,1,1,mlp_fc2,147648,"(192, 768)",APB_TARGET,layers.1.blocks.1.mlp.fc2
+28,LayerNorm,2,-1,norm,1536,"(768,)",SKIP_NON_LINEAR,layers.2.downsample.norm
+29,Linear,2,-1,downsample,294912,"(384, 768)",SKIP_BY_RULE,layers.2.downsample.reduction
+30,LayerNorm,2,0,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.0.norm1
+31,Linear,2,0,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.0.attn.qkv
+32,Linear,2,0,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.0.attn.proj
+33,LayerNorm,2,0,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.0.norm2
+34,Linear,2,0,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.0.mlp.fc1
+35,Linear,2,0,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.0.mlp.fc2
+36,LayerNorm,2,1,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.1.norm1
+37,Linear,2,1,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.1.attn.qkv
+38,Linear,2,1,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.1.attn.proj
+39,LayerNorm,2,1,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.1.norm2
+40,Linear,2,1,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.1.mlp.fc1
+41,Linear,2,1,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.1.mlp.fc2
+42,LayerNorm,2,2,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.2.norm1
+43,Linear,2,2,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.2.attn.qkv
+44,Linear,2,2,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.2.attn.proj
+45,LayerNorm,2,2,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.2.norm2
+46,Linear,2,2,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.2.mlp.fc1
+47,Linear,2,2,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.2.mlp.fc2
+48,LayerNorm,2,3,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.3.norm1
+49,Linear,2,3,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.3.attn.qkv
+50,Linear,2,3,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.3.attn.proj
+51,LayerNorm,2,3,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.3.norm2
+52,Linear,2,3,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.3.mlp.fc1
+53,Linear,2,3,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.3.mlp.fc2
+54,LayerNorm,2,4,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.4.norm1
+55,Linear,2,4,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.4.attn.qkv
+56,Linear,2,4,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.4.attn.proj
+57,LayerNorm,2,4,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.4.norm2
+58,Linear,2,4,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.4.mlp.fc1
+59,Linear,2,4,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.4.mlp.fc2
+60,LayerNorm,2,5,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.5.norm1
+61,Linear,2,5,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.5.attn.qkv
+62,Linear,2,5,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.5.attn.proj
+63,LayerNorm,2,5,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.5.norm2
+64,Linear,2,5,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.5.mlp.fc1
+65,Linear,2,5,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.5.mlp.fc2
+66,LayerNorm,2,6,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.6.norm1
+67,Linear,2,6,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.6.attn.qkv
+68,Linear,2,6,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.6.attn.proj
+69,LayerNorm,2,6,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.6.norm2
+70,Linear,2,6,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.6.mlp.fc1
+71,Linear,2,6,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.6.mlp.fc2
+72,LayerNorm,2,7,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.7.norm1
+73,Linear,2,7,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.7.attn.qkv
+74,Linear,2,7,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.7.attn.proj
+75,LayerNorm,2,7,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.7.norm2
+76,Linear,2,7,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.7.mlp.fc1
+77,Linear,2,7,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.7.mlp.fc2
+78,LayerNorm,2,8,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.8.norm1
+79,Linear,2,8,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.8.attn.qkv
+80,Linear,2,8,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.8.attn.proj
+81,LayerNorm,2,8,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.8.norm2
+82,Linear,2,8,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.8.mlp.fc1
+83,Linear,2,8,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.8.mlp.fc2
+84,LayerNorm,2,9,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.9.norm1
+85,Linear,2,9,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.9.attn.qkv
+86,Linear,2,9,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.9.attn.proj
+87,LayerNorm,2,9,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.9.norm2
+88,Linear,2,9,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.9.mlp.fc1
+89,Linear,2,9,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.9.mlp.fc2
+90,LayerNorm,2,10,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.10.norm1
+91,Linear,2,10,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.10.attn.qkv
+92,Linear,2,10,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.10.attn.proj
+93,LayerNorm,2,10,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.10.norm2
+94,Linear,2,10,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.10.mlp.fc1
+95,Linear,2,10,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.10.mlp.fc2
+96,LayerNorm,2,11,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.11.norm1
+97,Linear,2,11,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.11.attn.qkv
+98,Linear,2,11,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.11.attn.proj
+99,LayerNorm,2,11,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.11.norm2
+100,Linear,2,11,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.11.mlp.fc1
+101,Linear,2,11,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.11.mlp.fc2
+102,LayerNorm,2,12,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.12.norm1
+103,Linear,2,12,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.12.attn.qkv
+104,Linear,2,12,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.12.attn.proj
+105,LayerNorm,2,12,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.12.norm2
+106,Linear,2,12,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.12.mlp.fc1
+107,Linear,2,12,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.12.mlp.fc2
+108,LayerNorm,2,13,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.13.norm1
+109,Linear,2,13,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.13.attn.qkv
+110,Linear,2,13,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.13.attn.proj
+111,LayerNorm,2,13,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.13.norm2
+112,Linear,2,13,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.13.mlp.fc1
+113,Linear,2,13,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.13.mlp.fc2
+114,LayerNorm,2,14,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.14.norm1
+115,Linear,2,14,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.14.attn.qkv
+116,Linear,2,14,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.14.attn.proj
+117,LayerNorm,2,14,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.14.norm2
+118,Linear,2,14,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.14.mlp.fc1
+119,Linear,2,14,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.14.mlp.fc2
+120,LayerNorm,2,15,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.15.norm1
+121,Linear,2,15,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.15.attn.qkv
+122,Linear,2,15,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.15.attn.proj
+123,LayerNorm,2,15,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.15.norm2
+124,Linear,2,15,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.15.mlp.fc1
+125,Linear,2,15,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.15.mlp.fc2
+126,LayerNorm,2,16,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.16.norm1
+127,Linear,2,16,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.16.attn.qkv
+128,Linear,2,16,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.16.attn.proj
+129,LayerNorm,2,16,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.16.norm2
+130,Linear,2,16,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.16.mlp.fc1
+131,Linear,2,16,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.16.mlp.fc2
+132,LayerNorm,2,17,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.17.norm1
+133,Linear,2,17,attn_qkv,443520,"(1152, 384)",APB_TARGET,layers.2.blocks.17.attn.qkv
+134,Linear,2,17,attn_proj,147840,"(384, 384)",APB_TARGET,layers.2.blocks.17.attn.proj
+135,LayerNorm,2,17,norm,768,"(384,)",SKIP_NON_LINEAR,layers.2.blocks.17.norm2
+136,Linear,2,17,mlp_fc1,591360,"(1536, 384)",APB_TARGET,layers.2.blocks.17.mlp.fc1
+137,Linear,2,17,mlp_fc2,590208,"(384, 1536)",APB_TARGET,layers.2.blocks.17.mlp.fc2
+138,LayerNorm,3,-1,norm,3072,"(1536,)",SKIP_NON_LINEAR,layers.3.downsample.norm
+139,Linear,3,-1,downsample,1179648,"(768, 1536)",SKIP_BY_RULE,layers.3.downsample.reduction
+140,LayerNorm,3,0,norm,1536,"(768,)",SKIP_NON_LINEAR,layers.3.blocks.0.norm1
+141,Linear,3,0,attn_qkv,1771776,"(2304, 768)",APB_TARGET,layers.3.blocks.0.attn.qkv
+142,Linear,3,0,attn_proj,590592,"(768, 768)",APB_TARGET,layers.3.blocks.0.attn.proj
+143,LayerNorm,3,0,norm,1536,"(768,)",SKIP_NON_LINEAR,layers.3.blocks.0.norm2
+144,Linear,3,0,mlp_fc1,2362368,"(3072, 768)",APB_TARGET,layers.3.blocks.0.mlp.fc1
+145,Linear,3,0,mlp_fc2,2360064,"(768, 3072)",APB_TARGET,layers.3.blocks.0.mlp.fc2
+146,LayerNorm,3,1,norm,1536,"(768,)",SKIP_NON_LINEAR,layers.3.blocks.1.norm1
+147,Linear,3,1,attn_qkv,1771776,"(2304, 768)",APB_TARGET,layers.3.blocks.1.attn.qkv
+148,Linear,3,1,attn_proj,590592,"(768, 768)",APB_TARGET,layers.3.blocks.1.attn.proj
+149,LayerNorm,3,1,norm,1536,"(768,)",SKIP_NON_LINEAR,layers.3.blocks.1.norm2
+150,Linear,3,1,mlp_fc1,2362368,"(3072, 768)",APB_TARGET,layers.3.blocks.1.mlp.fc1
+151,Linear,3,1,mlp_fc2,2360064,"(768, 3072)",APB_TARGET,layers.3.blocks.1.mlp.fc2
+152,LayerNorm,-1,-1,last,1536,"(768,)",SKIP_NON_LINEAR,norm
+153,Linear,-1,-1,last,769000,"(1000, 768)",SKIP_BY_RULE,head.fc

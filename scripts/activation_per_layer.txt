@@ -1,0 +1,191 @@
+==============================================================================================================
+PER-LAYER ACTIVATION QUANTIZATION ANALYSIS (Swin-S)
+==============================================================================================================
+
+## SUMMARY: 100 Linear input activations + 2 attention matmul activations per block
+
+Group by source/distribution:
+
+  [24x] source=LayerNorm(norm1).out
+       distribution: Gaussian-like, near-zero-mean
+       quantizer:    uniform-layer-A4
+       risk:         low
+       example:      layers.0.blocks.0.attn.qkv
+
+  [24x] source=attn @ V (post-softmax aggregation)
+       distribution: mixed; depends on attention sparsity
+       quantizer:    uniform-channel-A4
+       risk:         med
+       example:      layers.0.blocks.0.attn.proj
+
+  [24x] source=LayerNorm(norm2).out
+       distribution: Gaussian-like, near-zero-mean
+       quantizer:    uniform-layer-A4
+       risk:         low
+       example:      layers.0.blocks.0.mlp.fc1
+
+  [24x] source=GELU.out
+       distribution: asymmetric: tail in +, clipped at ~-0.17 in -
+       quantizer:    asymmetric-uniform-A4
+       risk:         med
+       example:      layers.0.blocks.0.mlp.fc2
+
+  [3x] source=LayerNorm(downsample.norm).out (concatenated 2x2 patches)
+       distribution: Gaussian-like but 4x channel concat → wider variance per channel
+       quantizer:    uniform-channel-A8 (if quantized)
+       risk:         med
+       example:      layers.1.downsample.reduction
+
+  [1x] source=LayerNorm(final norm).out + global pool
+       distribution: Gaussian, near-zero-mean
+       quantizer:    KEEP FP (or A8)
+       risk:         high
+       example:      head.fc
+
+
+## PER-LINEAR DETAIL
+
+layer                                         in_dim →   out  quantizer              risk   source
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+layers.0.blocks.0.attn.qkv                        96 →   288  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.0.blocks.0.attn.proj                       96 →    96  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.0.blocks.0.mlp.fc1                         96 →   384  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.0.blocks.0.mlp.fc2                        384 →    96  asymmetric-uniform-A4  med    GELU.out
+layers.0.blocks.1.attn.qkv                        96 →   288  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.0.blocks.1.attn.proj                       96 →    96  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.0.blocks.1.mlp.fc1                         96 →   384  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.0.blocks.1.mlp.fc2                        384 →    96  asymmetric-uniform-A4  med    GELU.out
+layers.1.downsample.reduction                    384 →   192  uniform-channel-A8 (if quantized) med    LayerNorm(downsample.norm).out (concatenated 2x2 patches)
+layers.1.blocks.0.attn.qkv                       192 →   576  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.1.blocks.0.attn.proj                      192 →   192  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.1.blocks.0.mlp.fc1                        192 →   768  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.1.blocks.0.mlp.fc2                        768 →   192  asymmetric-uniform-A4  med    GELU.out
+layers.1.blocks.1.attn.qkv                       192 →   576  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.1.blocks.1.attn.proj                      192 →   192  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.1.blocks.1.mlp.fc1                        192 →   768  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.1.blocks.1.mlp.fc2                        768 →   192  asymmetric-uniform-A4  med    GELU.out
+layers.2.downsample.reduction                    768 →   384  uniform-channel-A8 (if quantized) med    LayerNorm(downsample.norm).out (concatenated 2x2 patches)
+layers.2.blocks.0.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.0.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.0.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.0.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.1.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.1.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.1.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.1.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.2.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.2.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.2.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.2.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.3.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.3.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.3.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.3.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.4.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.4.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.4.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.4.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.5.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.5.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.5.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.5.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.6.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.6.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.6.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.6.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.7.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.7.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.7.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.7.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.8.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.8.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.8.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.8.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.9.attn.qkv                       384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.9.attn.proj                      384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.9.mlp.fc1                        384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.9.mlp.fc2                       1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.10.attn.qkv                      384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.10.attn.proj                     384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.10.mlp.fc1                       384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.10.mlp.fc2                      1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.11.attn.qkv                      384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.11.attn.proj                     384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.11.mlp.fc1                       384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.11.mlp.fc2                      1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.12.attn.qkv                      384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.12.attn.proj                     384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.12.mlp.fc1                       384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.12.mlp.fc2                      1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.13.attn.qkv                      384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.13.attn.proj                     384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.13.mlp.fc1                       384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.13.mlp.fc2                      1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.14.attn.qkv                      384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.14.attn.proj                     384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.14.mlp.fc1                       384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.14.mlp.fc2                      1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.15.attn.qkv                      384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.15.attn.proj                     384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.15.mlp.fc1                       384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.15.mlp.fc2                      1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.16.attn.qkv                      384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.16.attn.proj                     384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.16.mlp.fc1                       384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.16.mlp.fc2                      1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.2.blocks.17.attn.qkv                      384 →  1152  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.2.blocks.17.attn.proj                     384 →   384  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.2.blocks.17.mlp.fc1                       384 →  1536  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.2.blocks.17.mlp.fc2                      1536 →   384  asymmetric-uniform-A4  med    GELU.out
+layers.3.downsample.reduction                   1536 →   768  uniform-channel-A8 (if quantized) med    LayerNorm(downsample.norm).out (concatenated 2x2 patches)
+layers.3.blocks.0.attn.qkv                       768 →  2304  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.3.blocks.0.attn.proj                      768 →   768  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.3.blocks.0.mlp.fc1                        768 →  3072  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.3.blocks.0.mlp.fc2                       3072 →   768  asymmetric-uniform-A4  med    GELU.out
+layers.3.blocks.1.attn.qkv                       768 →  2304  uniform-layer-A4       low    LayerNorm(norm1).out
+layers.3.blocks.1.attn.proj                      768 →   768  uniform-channel-A4     med    attn @ V (post-softmax aggregation)
+layers.3.blocks.1.mlp.fc1                        768 →  3072  uniform-layer-A4       low    LayerNorm(norm2).out
+layers.3.blocks.1.mlp.fc2                       3072 →   768  asymmetric-uniform-A4  med    GELU.out
+head.fc                                          768 →  1000  KEEP FP (or A8)        high   LayerNorm(final norm).out + global pool
+
+
+## NON-LINEAR ACTIVATIONS (matmul inside attention)
+
+These are NOT inputs to a Linear, but are quantized in W4/A4 setting:
+
+  - <block>.attn.q_at_kT
+      source:       Q @ K.T / sqrt(d_head)
+      distribution: long-tail, mostly small + few large peaks
+      quantizer:    log2 / power-of-2
+      risk:         high
+      notes:        feeds softmax; uniform quantization clips large peaks
+
+  - <block>.attn.softmax_out
+      source:       softmax(QK^T + rel_pos_bias)
+      distribution: [0,1] heavy-tail (most ≈0, few near 1)
+      quantizer:    log2 (post-softmax specialized)
+      risk:         high
+      notes:        attention sparsity → most values tiny; linear quantizer wastes range
+
+
+## QUANTIZER COUNT REQUIRED (per block × 24 blocks)
+
+Per Swin block, FIMA-Q standard setup needs:
+  4 input quantizers for Linears (qkv, proj, fc1, fc2)
+  2 matmul quantizers in attention (QK^T, softmax_out)
+  = 6 activation quantizers per block × 24 blocks = 144 quantizers
+
++ 3 input quantizers for downsample.reduction (stages 1,2,3)
++ 1 input quantizer for head.fc (optional, often FP)
+= ~148 activation quantizers total in full Swin-S
+
+
+## DECISION TABLE: which to quantize aggressively vs keep high precision
+
+level    count  description
+------------------------------------------------------------------------------------------
+A4-easy    48   inputs to qkv + fc1 (post-LN, well-conditioned)
+A4-asym    24   inputs to fc2 (post-GELU, asymmetric)
+A4-chan    24   inputs to attn.proj (post softmax@V)
+A4-log     48   QK^T inputs + softmax outputs (heavy-tail)
+A8-or-FP    4   downsample inputs + head input
