@@ -1,0 +1,56 @@
+# =========================================
+# NenVIT — APB + FIMA-Q on Swin Transformer
+# =========================================
+
+# Trained checkpoints (too large, 100MB+)
+checkpoints/
+*.pth
+*.bin
+*.safetensors
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.coverage
+.tox/
+
+# Virtual envs
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+.cadence/
+
+# OS / temp
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+*~
+
+# HuggingFace cache (if accidentally placed inside project)
+.cache/
+hf_cache/
+
+# Editor-generated quick debug files
+_test_imports*.py
+_scratch*.py
+
+# Output artifacts of analysis scripts
+scripts/fim_weight.pt
+apb_fimaq/_test_*.py

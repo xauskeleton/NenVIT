@@ -1,0 +1,75 @@
+================================================================================
+SWIN-S COMPACT STRUCTURE (grouped by layer pattern)
+================================================================================
+
+## TOP-LEVEL
+
+  patch_embed          PatchEmbed
+  layers               Sequential
+  norm                 LayerNorm
+  head                 ClassifierHead
+
+## STAGES (4 stages, depths follow Swin-S spec)
+
+  stage_0: depth= 2  C= 96  qkv=(288, 96)
+  stage_1: depth= 2  C=192  qkv=(576, 192)
+  stage_2: depth=18  C=384  qkv=(1152, 384)
+  stage_3: depth= 2  C=768  qkv=(2304, 768)
+
+## LINEAR LAYERS (grouped by leaf name)
+
+
+  [qkv]  24 instances, total 11,805,120 params (11.81M)
+    weight=(288, 96)             x2    first: layers.0.blocks.0.attn.qkv
+    weight=(576, 192)            x2    first: layers.1.blocks.0.attn.qkv
+    weight=(1152, 384)           x18   first: layers.2.blocks.0.attn.qkv
+    weight=(2304, 768)           x2    first: layers.3.blocks.0.attn.qkv
+
+  [proj]  24 instances, total 3,935,040 params (3.94M)
+    weight=(96, 96)              x2    first: layers.0.blocks.0.attn.proj
+    weight=(192, 192)            x2    first: layers.1.blocks.0.attn.proj
+    weight=(384, 384)            x18   first: layers.2.blocks.0.attn.proj
+    weight=(768, 768)            x2    first: layers.3.blocks.0.attn.proj
+
+  [fc1]  24 instances, total 15,740,160 params (15.74M)
+    weight=(384, 96)             x2    first: layers.0.blocks.0.mlp.fc1
+    weight=(768, 192)            x2    first: layers.1.blocks.0.mlp.fc1
+    weight=(1536, 384)           x18   first: layers.2.blocks.0.mlp.fc1
+    weight=(3072, 768)           x2    first: layers.3.blocks.0.mlp.fc1
+
+  [fc2]  24 instances, total 15,713,088 params (15.71M)
+    weight=(96, 384)             x2    first: layers.0.blocks.0.mlp.fc2
+    weight=(192, 768)            x2    first: layers.1.blocks.0.mlp.fc2
+    weight=(384, 1536)           x18   first: layers.2.blocks.0.mlp.fc2
+    weight=(768, 3072)           x2    first: layers.3.blocks.0.mlp.fc2
+
+  [reduction]  3 instances, total 1,548,288 params (1.55M)
+    weight=(192, 384)            x1    first: layers.1.downsample.reduction
+    weight=(384, 768)            x1    first: layers.2.downsample.reduction
+    weight=(768, 1536)           x1    first: layers.3.downsample.reduction
+
+  [fc]  1 instances, total 769,000 params (0.77M)
+    weight=(1000, 768)           x1    first: head.fc
+
+## NON-LINEAR LAYERS
+
+  Conv2d   patch_embed.proj  weight=(96, 3, 4, 4)
+  Conv2d   total: 1
+  LayerNorm total: 53
+  Activation/Dropout total: 121
+
+## APB TARGETS (filter logic)
+
+  APB target Linears:   96  (~47.19M params)
+  APB skip Linears:      4
+  Skip list:
+    SKIP  layers.1.downsample.reduction  (192, 384)
+    SKIP  layers.2.downsample.reduction  (384, 768)
+    SKIP  layers.3.downsample.reduction  (768, 1536)
+    SKIP  head.fc  (1000, 768)
+
+## PARAM TOTALS
+
+  Total params:             49,606,258  (49.61M)
+  Linear params:            49,510,696  (99.8%)
+  APB-eligible params:      47,193,408  (95.1%)
