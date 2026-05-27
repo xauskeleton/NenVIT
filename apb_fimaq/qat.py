@@ -46,13 +46,43 @@ from tiny_imagenet_loader import TinyImageNetLoaderGenerator  # noqa: E402
 # ============================================================
 # APB LAYER
 # ============================================================
+class _APBSTE(torch.autograd.Function):
+    """Custom STE preserving BOTH latent_weight AND α gradients.
+
+    Forward:
+        out[i,j] = α · sign(w[i,j])  if mask[i,j]  (binary zone)
+                 = w[i,j]            otherwise     (FP zone)
+
+    Backward (per paper APB Eq 4 + 8):
+        ∂out/∂w_ij = 1      ∀(i,j)              ← STE identity for latent_weight
+        ∂out/∂α    = sign(w_ij) χ_B(i,j)         ← α gets grad only from binary zone
+
+    NOTE: The naive STE `w + (eff - w).detach()` blocks α's gradient because
+    the entire (eff - w) is treated as a constant. We need a custom Function
+    to correctly propagate both gradients separately.
+    """
+    @staticmethod
+    def forward(ctx, w, alpha, mask):
+        binary = alpha * torch.sign(w)
+        out = torch.where(mask, binary, w)
+        ctx.save_for_backward(w, mask)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        w, mask = ctx.saved_tensors
+        grad_w = grad_out                                          # STE identity
+        grad_alpha = (grad_out * torch.sign(w) * mask).sum()       # binary-only
+        return grad_w, grad_alpha, None                            # mask: no grad
+
+
 class APBLinear(nn.Module):
     """nn.Linear wrapper with APB partition.
 
     Forward (per weight w_ij):
         mask[i,j] = True   →  α · sign(w_ij)       (1-bit binary)
         mask[i,j] = False  →  w_ij                  (FP32, learnable)
-    Backward: STE — gradient passes through latent_weight unchanged.
+    Backward: STE — both α and latent_weight receive correct gradients.
     """
     def __init__(self, linear: nn.Linear, mask: torch.Tensor):
         super().__init__()
@@ -60,17 +90,16 @@ class APBLinear(nn.Module):
         self.out_features = linear.out_features
         self.latent_weight = nn.Parameter(linear.weight.data.clone())
         self.bias = linear.bias
-        # α: scalar learnable, init from mean|w|
+        # α: scalar learnable, init from mean|w|; kept positive via abs() in forward
         self.alpha = nn.Parameter(self.latent_weight.detach().abs().mean())
         # Mask: True = binary. Frozen throughout training.
         self.register_buffer('mask', mask.bool())
 
     def forward(self, x):
-        binary = self.alpha.abs() * torch.sign(self.latent_weight)
-        eff_w = torch.where(self.mask, binary, self.latent_weight)
-        # STE: forward yields eff_w, backward yields latent_weight
-        out_w = self.latent_weight + (eff_w - self.latent_weight).detach()
-        return F.linear(x, out_w, self.bias)
+        # alpha.abs() to keep binary magnitude positive (paper convention).
+        # Grad flows correctly through abs (sign(alpha) backward).
+        eff_w = _APBSTE.apply(self.latent_weight, self.alpha.abs(), self.mask)
+        return F.linear(x, eff_w, self.bias)
 
     @property
     def binary_ratio(self) -> float:
@@ -84,16 +113,35 @@ class APBLinear(nn.Module):
 # ============================================================
 # TARGET LAYER FILTER
 # ============================================================
-SKIP_PATTERNS = ('downsample.reduction', 'head', 'patch_embed')
+SKIP_PATTERNS_SKIP = ('downsample.reduction', 'head', 'patch_embed')  # default: skip 4 critical
+SKIP_PATTERNS_FULL = ('patch_embed',)                                  # full: only skip Conv2d
 
-def get_target_layers(model: nn.Module) -> dict:
-    """Return {name: module} of APB targets (96 in Swin-S).
-    Works for both pre-wrap (nn.Linear) and post-wrap (APBLinear) states."""
+
+def get_target_layers(model: nn.Module, scope: str = 'skip') -> dict:
+    """
+    Return {name: module} of APB targets. Works for both pre-wrap (nn.Linear)
+    and post-wrap (APBLinear) states.
+
+    scope='skip' (default): 96 Linears — qkv/proj/fc1/fc2 × 24 blocks.
+        Skips head.fc, 3 downsample.reduction, patch_embed (Conv2d anyway).
+        Safe: doesn't touch classifier output or cross-resolution merge.
+
+    scope='full': 100 Linears — adds head.fc + 3 downsample.reduction to APB.
+        Aggressive: maximize compression coverage but risk accuracy drop.
+        patch_embed.proj (Conv2d) still skipped since APBLinear only wraps nn.Linear.
+    """
+    if scope == 'skip':
+        skip_patterns = SKIP_PATTERNS_SKIP
+    elif scope == 'full':
+        skip_patterns = SKIP_PATTERNS_FULL
+    else:
+        raise ValueError(f'scope must be "skip" or "full", got {scope!r}')
+
     targets = {}
     for n, m in model.named_modules():
         if isinstance(m, APBLinear):
             targets[n] = m
-        elif isinstance(m, nn.Linear) and not any(p in n for p in SKIP_PATTERNS):
+        elif isinstance(m, nn.Linear) and not any(p in n for p in skip_patterns):
             targets[n] = m
     return targets
 
@@ -102,7 +150,8 @@ def get_target_layers(model: nn.Module) -> dict:
 # FIM EXTRACTION — DPLR (Diagonal + Low-Rank), per FIMA-Q Eq (20-21)
 # ============================================================
 def compute_weight_dplr_fim(model, calib_loader, device,
-                             n_batches=5, p1=1.0, p2=1.0, fim_mode='dplr'):
+                             n_batches=5, p1=1.0, p2=1.0, fim_mode='dplr',
+                             scope='skip'):
     """
     Compute DPLR-FIM-based importance for each target Linear's weights.
 
@@ -127,7 +176,7 @@ def compute_weight_dplr_fim(model, calib_loader, device,
     Returns:
       dict {name: F_DPLR(W) tensor of shape (out, in)}
     """
-    targets = get_target_layers(model)
+    targets = get_target_layers(model, scope=scope)
     # Accumulators
     x_sq  = {n: 0.0 for n in targets}   # E[x²] per input channel
     g_abs = {n: 0.0 for n in targets}   # E[|g|]  per output channel  (for diag)
@@ -191,9 +240,9 @@ compute_weight_fim = compute_weight_dplr_fim
 # ============================================================
 # APPLY APB (replace nn.Linear → APBLinear)
 # ============================================================
-def apply_apb(model, fim_dict, binary_ratio, device):
+def apply_apb(model, fim_dict, binary_ratio, device, scope='skip'):
     """Wrap each target Linear with APBLinear using FIM-percentile mask."""
-    targets = get_target_layers(model)
+    targets = get_target_layers(model, scope=scope)
     for name, mod in targets.items():
         if isinstance(mod, APBLinear):
             continue  # already wrapped
@@ -210,13 +259,13 @@ def apply_apb(model, fim_dict, binary_ratio, device):
     return model
 
 
-def update_masks_from_fim(model, fim_dict, binary_ratio):
+def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip'):
     """Refresh masks of APBLinear layers in-place using new FIM values.
     Keeps latent_weight, α, and structure intact — only mask buffer changes."""
     n_updated = 0
     n_flipped_total = 0
     n_weights_total = 0
-    for name, mod in get_target_layers(model).items():
+    for name, mod in get_target_layers(model, scope=scope).items():
         if not isinstance(mod, APBLinear):
             continue
         if name not in fim_dict:
@@ -364,9 +413,10 @@ class DPLRBlockLoss(nn.Module):
 
     def compute(self) -> torch.Tensor:
         """Sum L_DPLR over all blocks for current batch (caches must be populated)."""
+        device = next(self.model_fp.parameters()).device
+        total = torch.tensor(0.0, device=device)
         if not self.states:
-            return torch.tensor(0.0, device=next(self.model_fp.parameters()).device)
-        total = 0.0
+            return total
         for name, s in self.states.items():
             if name not in self.z_apb_cache or name not in self.z_fp_cache:
                 continue
@@ -422,6 +472,10 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--binary-ratio', type=float, default=0.75,
                    help='Fraction of weights to binarize (default 0.75)')
+    p.add_argument('--apb-scope', choices=['skip', 'full'], default='skip',
+                   help='Layer scope for APB. '
+                        '"skip" = 96 Linears (default; safe, skips head + 3 downsample + patch_embed). '
+                        '"full" = 100 Linears (aggressive; includes head.fc + downsample.reduction).')
     p.add_argument('--epochs', type=int, default=10)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--batch-size', type=int, default=64)
@@ -457,7 +511,8 @@ def main():
     args = p.parse_args()
 
     if args.debug:
-        args.epochs = 1; args.fim_batches = 1; args.batch_size = 32; args.num_workers = 0
+        args.epochs = 2; args.fim_batches = 1; args.batch_size = 32; args.num_workers = 0
+        # 2 epochs so recompute-fim-every=1 can be tested if user passes it
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed); np.random.seed(args.seed); torch.cuda.manual_seed_all(args.seed)
@@ -495,12 +550,14 @@ def main():
     fim_dict = compute_weight_dplr_fim(model, calib_loader, device,
                                         n_batches=args.fim_batches,
                                         p1=args.fim_p1, p2=args.fim_p2,
-                                        fim_mode=args.fim_mode)
-    print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers')
+                                        fim_mode=args.fim_mode,
+                                        scope=args.apb_scope)
+    print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers '
+          f'(scope={args.apb_scope})')
 
     # ----- Apply APB -----
-    print(f'Applying APB (binary_ratio={args.binary_ratio}) ...')
-    model = apply_apb(model, fim_dict, args.binary_ratio, device)
+    print(f'Applying APB (scope={args.apb_scope}, binary_ratio={args.binary_ratio}) ...')
+    model = apply_apb(model, fim_dict, args.binary_ratio, device, scope=args.apb_scope)
     nl, rb, bits = avg_apb_stats(model)
     print(f'APB: {nl} layers wrapped | avg binary={rb:.3f} | avg eff_bits={bits:.2f}')
 
@@ -521,7 +578,14 @@ def main():
               f'λ={args.dplr_lambda}, p1={args.fim_p1}, p2={args.fim_p2}')
 
     # ----- QAT -----
-    opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Paper APB convention: weight_decay applies to weights/bias only, NOT to α.
+    # Excluding α prevents WD from pulling it toward 0 (which would kill binary magnitude).
+    alpha_params  = [p for n, p in model.named_parameters() if 'alpha' in n]
+    other_params  = [p for n, p in model.named_parameters() if 'alpha' not in n]
+    opt = optim.AdamW([
+        {'params': other_params, 'weight_decay': 1e-4},
+        {'params': alpha_params, 'weight_decay': 0.0},
+    ], lr=args.lr)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     crit = nn.CrossEntropyLoss()
     best_top1 = 0.0
@@ -539,8 +603,10 @@ def main():
             fim_new = compute_weight_dplr_fim(model, calib_loader, device,
                                               n_batches=args.fim_batches,
                                               p1=args.fim_p1, p2=args.fim_p2,
-                                              fim_mode=args.fim_mode)
-            n_upd, flip_pct = update_masks_from_fim(model, fim_new, args.binary_ratio)
+                                              fim_mode=args.fim_mode,
+                                              scope=args.apb_scope)
+            n_upd, flip_pct = update_masks_from_fim(model, fim_new, args.binary_ratio,
+                                                     scope=args.apb_scope)
             print(f'  >> Epoch {ep+1}: refreshed FIM ({n_upd} layers, '
                   f'{flip_pct:.1f}% positions flipped) in {time.time()-t_fim:.1f}s')
 
