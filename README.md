@@ -1,118 +1,118 @@
-# NenVIT — APB + FIMA-Q on Swin Transformer
+# NenVIT — APB + FIMA-Q QAT on Swin-S
 
-Combining **Automatic Prune Binarization (APB)** with **FIMA-Q** (Fisher Information Matrix Approximation for PTQ) to compress Swin Transformer.
+Nén Swin Transformer cho Tiny ImageNet bằng **APB binarization** ([arXiv:2306.08960](https://arxiv.org/abs/2306.08960)),
+chọn weight binary/FP bằng **DPLR-FIM importance** từ FIMA-Q ([arXiv:2506.11543](https://arxiv.org/abs/2506.11543)).
+QAT end-to-end với CE loss + optional DPLR distillation loss.
 
-**Core idea:** Use FIMA-Q's FIM importance scores (instead of magnitude) to decide which weights to binarize (±α) vs keep full-precision, then re-optimize with FIMA-Q's DPLR-FIM block reconstruction loss.
-
-## Papers
-
-- **APB** — Nardini et al. *Neural Network Compression using Binarization and Few Full-Precision Weights*, arXiv:2306.08960v2
-- **FIMA-Q** — Wu et al. *FIMA-Q: Post-Training Quantization for Vision Transformers by Fisher Information Matrix Approximation*, CVPR 2025, arXiv:2506.11543v1
-
-PDFs in repo for convenience.
-
-## Repo structure
-
-```
-.
-├── apb_fimaq/                            ← OUR contribution (the APB extension)
-│   ├── apb_weight_quantizer.py           Core APB(w)=α·sign(w) with STE backward
-│   ├── fim_weight_extractor.py           Bridge F_diag(z) → F_diag(W)
-│   ├── apb_wrap.py                       Filter 96 target Linears + replace w_quantizer
-│   ├── run_phase_a.py                    Phase A: standard FIMA-Q W4A4 baseline
-│   ├── run_apb_pipeline.py               Full pipeline A→B→C→D
-│   ├── debug_pipeline.py                 Fast smoke test
-│   └── test_apb_weight_quantizer.py      Unit tests (9/9 pass)
-│
-├── scripts/                              ← Analysis + dataloader
-│   ├── tiny_imagenet_loader.py           HF Tiny ImageNet → FIMA-Q's LoaderGenerator
-│   ├── 02_smoketest_swin.py              FP baseline eval
-│   ├── dump_swin_*.py                    Inspection scripts
-│   ├── analyze_*.py                      Per-layer quantizability analysis
-│   └── *.txt, *.csv                      Generated reports
-│
-├── FIMA-Q/FIMA-Q/                        ← Upstream FIMA-Q (UNTOUCHED)
-│
-├── APB_FIMAQ_Swin_Implementation_Guide.md
-├── 2306.08960v2 (1).pdf                  APB paper
-└── 2506.11543v1.pdf                      FIMA-Q paper
-```
-
-## Pipeline overview
-
-| Phase | What it does | Code |
-|---|---|---|
-| **A** | Standard FIMA-Q: wrap → calibrate → DPLR-FIM block reconstruction → W4A4 baseline | uses upstream FIMA-Q |
-| **B** | Extract `F_diag(W_ij) ≈ E[\|∇z_i\|] · E[x_j²]` per APB target Linear (96 layers) | `fim_weight_extractor.py` |
-| **C** | Replace each target's `w_quantizer` with `APBWeightQuantizer`; mask = (FIM < τ) | `apb_wrap.py` |
-| **D** | Re-run block reconstruction; only activation scales fine-tune (APB partition frozen) | reuses FIMA-Q (TODO: subclass to skip AdaRound re-wrap on APB layers) |
-
-## APB target selection
-
-**96 Linears** out of 100 (qkv, attn.proj, mlp.fc1, mlp.fc2 across all 24 Swin blocks).
-
-**Skipped (4):** 3 `downsample.reduction` + `head.fc`. Also skipped: `patch_embed.proj` (Conv2d), all 53 LayerNorm.
-
-→ Coverage: 47.19M / 49.61M params = **95.1% of the model**.
-
-## Setup
-
-```bash
-# Create env (Python 3.10)
-conda create -n fimaq_apb python=3.10 -y
-conda activate fimaq_apb
-
-# Install PyTorch (CUDA 12.8 for RTX 50-series Blackwell support)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-
-# Install other deps
-pip install datasets timm scipy matplotlib
-```
-
-## Dataset
-
-Uses **Tiny ImageNet** (200 classes, 64×64) via Hugging Face for debug/dev. 18 classes outside ImageNet-1k are auto-filtered → 182 classes mapped to ImageNet-1k indices so pretrained Swin works directly. See `scripts/tiny_imagenet_loader.py`.
+**Novelty:** FIM-based mask thay magnitude, áp lần đầu cho Vision Transformer.
 
 ## Run
 
 ```bash
-# Quick debug (~1 min end-to-end with tiny sizes)
-python apb_fimaq/debug_pipeline.py
+# Quick test
+python apb_fimaq/qat.py --debug
 
-# Phase A only (FIMA-Q baseline W4A4)
-python apb_fimaq/run_phase_a.py --calib-size 64 --optim-size 256
+# Full
+python apb_fimaq/qat.py --use-dplr-loss --dplr-lambda 3000
 
-# Full pipeline with default 75% binary ratio
-python apb_fimaq/run_apb_pipeline.py
-
-# Per-role binary ratio (conservative for attention)
-python apb_fimaq/run_apb_pipeline.py \
-    --ratio-qkv 0.60 \
-    --ratio-proj 0.75 \
-    --ratio-fc1 0.85 \
-    --ratio-fc2 0.75
-
-# Reuse calibrated checkpoint
-python apb_fimaq/run_apb_pipeline.py \
-    --load-optimize-ckpt checkpoints/phase_a/phase_a_optimized.pth
+# Hoặc launcher với preset config
+python apb_fimaq/run_full.py
 ```
 
-## Status
+## Cấu trúc
 
-- ✅ Phase A wrap + calibration verified on Tiny ImageNet (smoke test passes)
-- ✅ Phase B FIM extraction (after fixing mode-switching and STE-mode bugs)
-- ✅ Phase C APB swap (96 layers, runs without crash)
-- ⚠️ Phase D needs subclass of `BlockReconstructor` to skip AdaRound re-wrap on APB layers
+```
+NenVIT/
+├── apb_fimaq/qat.py            Main pipeline (self-contained ~600 LOC)
+├── apb_fimaq/run_full.py       Launcher 1-lệnh với preset
+├── scripts/tiny_imagenet_loader.py    Tiny ImageNet via HF
+└── *.pdf                       APB + FIMA-Q papers
+```
 
-## Design principle
+## Pipeline
 
-**Do not modify FIMA-Q.** Subclass or copy-then-modify in `apb_fimaq/` instead. This keeps the upstream pristine for reproducibility and clean diffs.
+```
+1. Load Swin-S pretrained
+2. Compute DPLR-FIM(W) — k=5 batches forward+backward
+3. Apply APB: mask = (FIM < 75% percentile), wrap nn.Linear → APBLinear
+4. QAT 10-20 epochs: loss = CE + λ · Σ_blocks L_DPLR
+   - latent_weight + α học; mask FROZEN; freeze α ở epoch/2
+```
 
-## Hardware tested
+## APB Linear
 
-- NVIDIA RTX 5060 Ti (16GB, Blackwell sm_120)
-- CUDA 12.8 / PyTorch 2.11.0
+```python
+binary zone (mask=True):  α · sign(latent_weight)    # 1 bit
+FP zone     (mask=False): latent_weight              # 32 bit
+```
+
+Backward: custom STE preserves cả `latent_weight` và `α` gradient.
+
+## Target layers
+
+- **`--apb-scope skip`** (default): 96 Linears (qkv/proj/fc1/fc2 × 24), skip head + downsample + patch_embed → 95.1% params
+- **`--apb-scope full`**: 100 Linears, thêm head.fc + downsample.reduction → 98.2%
+
+## Key CLI flags
+
+| Flag | Default | |
+|---|---|---|
+| `--binary-ratio` | 0.75 | % weights binarize |
+| `--apb-scope` | skip | skip (96) hoặc full (100) layers |
+| `--epochs` | 10 | QAT epochs |
+| `--lr` | 1e-4 | AdamW |
+| `--batch-size` | 64 | |
+| `--fim-batches` | 5 | k samples cho FIM extract |
+| `--fim-mode` | dplr | dplr / rank / diag |
+| `--use-dplr-loss` | False | DPLR distillation loss |
+| `--dplr-lambda` | 1.0 | Dùng **3000** (raw DPLR ~0.002 vs CE ~6) |
+| `--debug` | False | 2-epoch smoke test |
+
+## Design quan trọng
+
+- **Mask FROZEN** (không recompute) → stability. Verified: 0% mask flip, 0.25% sign flip.
+- **α learnable** với custom STE (paper Eq 8: `∂L/∂α = Σ grad·sign(w)·χ_binary`).
+- **Weight decay** chỉ áp lên weights, **KHÔNG áp lên α** (paper APB rule).
+- **DPLR-FIM** dùng 2 chỗ:
+  - Importance ranking (per-weight, 1 lần) → set mask
+  - Loss distillation (per-block per-batch) → guide gradient
+
+## Dataset
+
+Tiny ImageNet (200 classes 64×64) via HuggingFace `zh-plus/tiny-imagenet`.
+18 classes outside ImageNet-1k auto-filter → 182 classes mapped to 1000 indices → dùng head pretrained trực tiếp.
+
+## Setup
+
+```bash
+conda create -n fimaq_apb python=3.10 -y && conda activate fimaq_apb
+# Blackwell (RTX 50xx):
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# Other GPUs (Kaggle, Ampere, ...):
+pip install torch torchvision
+pip install datasets timm
+```
+
+## Kaggle
+
+```python
+!git clone https://github.com/xauskeleton/NenVIT.git && cd NenVIT
+!pip install -q datasets timm
+!python apb_fimaq/qat.py --use-dplr-loss --dplr-lambda 3000 \
+    --batch-size 32 --out-dir /kaggle/working/qat
+```
+
+## Expected results
+
+| Stage | Top-1 Tiny val |
+|---|---|
+| FP baseline | 55.76% |
+| Post-APB (no train) | ~5% |
+| 2-ep debug | ~32% |
+| 20-ep target | **45-55%** |
+
+Paper FIMA-Q báo 81.82% Swin-S W4A4 trên full ImageNet-1k (task khác).
 
 ---
 
-*Project for NCKH (research). Author: xauskeleton*
+Repo: https://github.com/xauskeleton/NenVIT
