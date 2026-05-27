@@ -16,6 +16,7 @@ from pathlib import Path
 # ============================================================
 CONFIG = {
     # APB
+    'apb_scope':          'skip',  # 'skip' = 96 layers (safe) | 'full' = 100 layers (incl head + downsample)
     'binary_ratio':       0.75,    # % weights binarize
     # Training
     'epochs':             20,      # số epoch
@@ -26,11 +27,13 @@ CONFIG = {
     'fim_mode':           'dplr',  # 'dplr' | 'rank' | 'diag'
     'fim_p1':             1.0,     # weight rank-k (L2)
     'fim_p2':             1.0,     # weight diag (L1)
-    # Dynamic mask refresh
-    'recompute_fim_every': 2,      # refresh mask mỗi N epoch (0=disable)
-    # DPLR distillation loss
-    'use_dplr_loss':      True,    # bật DPLR distill loss với FP teacher
-    'dplr_lambda':        0.5,     # trọng số DPLR loss
+    # Dynamic mask refresh — DISABLED for stability
+    # Lý do: flip binary↔FP gây spike output (mất ổn định training).
+    # Mask cố định từ FIM init, chỉ sign (+α/-α) thay đổi qua training.
+    'recompute_fim_every': 0,
+    # DPLR distillation loss — guide gradient để quyết định sign (+α/-α) per weight
+    'use_dplr_loss':      True,
+    'dplr_lambda':        3000,    # sweet spot từ ablation debug
     # System
     'num_workers':        2,
     'seed':               3407,
