@@ -28,6 +28,7 @@ USAGE
 """
 import argparse
 import sys
+from tqdm.auto import tqdm
 import time
 from pathlib import Path
 
@@ -206,7 +207,7 @@ def compute_weight_dplr_fim(model, calib_loader, device,
 
     model.train()
     crit = nn.CrossEntropyLoss()
-    for i, (x, y) in enumerate(calib_loader):
+    for i, (x, y) in enumerate(tqdm(calib_loader, total=n_batches, desc='FIM extract', leave=False)):
         if i >= n_batches: break
         model.zero_grad()
         x = x.to(device); y = y.to(device)
@@ -443,7 +444,9 @@ class DPLRBlockLoss(nn.Module):
 def evaluate(model, loader, device, max_batches=None):
     model.eval()
     c1 = c5 = n = 0
-    for i, (x, y) in enumerate(loader):
+    total = max_batches if max_batches is not None else len(loader)
+    pbar = tqdm(loader, total=total, desc='eval', leave=False)
+    for i, (x, y) in enumerate(pbar):
         if max_batches is not None and i >= max_batches: break
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -452,6 +455,8 @@ def evaluate(model, loader, device, max_batches=None):
         c1 += (p5[:, 0] == y).sum().item()
         c5 += (p5 == y.unsqueeze(1)).any(dim=1).sum().item()
         n += y.size(0)
+        if n > 0:
+            pbar.set_postfix(top1=f'{100*c1/n:.2f}')
     return 100 * c1 / n, 100 * c5 / n, n
 
 
@@ -618,7 +623,10 @@ def main():
 
         model.train()
         t0 = time.time(); loss_sum = 0; ce_sum = 0; dplr_sum = 0; loss_n = 0
-        for i, (x, y) in enumerate(train_loader):
+        max_train_batches = 6 if args.debug else len(train_loader)
+        pbar = tqdm(train_loader, total=max_train_batches,
+                    desc=f'ep {ep+1}/{args.epochs}', leave=True)
+        for i, (x, y) in enumerate(pbar):
             opt.zero_grad()
             x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
 
@@ -630,10 +638,12 @@ def main():
             logits = model(x)                    # populates z_apb_cache (if hooks installed)
             loss_ce = crit(logits, y)
 
+            loss_dplr_val = 0.0
             if dplr is not None:
                 loss_dplr = dplr.compute()
                 loss = loss_ce + args.dplr_lambda * loss_dplr
-                dplr_sum += loss_dplr.detach().item() * y.size(0)
+                loss_dplr_val = loss_dplr.detach().item()
+                dplr_sum += loss_dplr_val * y.size(0)
             else:
                 loss = loss_ce
 
@@ -642,6 +652,12 @@ def main():
             loss_sum += loss.item() * y.size(0)
             ce_sum   += loss_ce.item() * y.size(0)
             loss_n   += y.size(0)
+            if dplr is not None:
+                pbar.set_postfix(loss=f'{loss.item():.3f}',
+                                 ce=f'{loss_ce.item():.3f}',
+                                 dplr=f'{loss_dplr_val:.4f}')
+            else:
+                pbar.set_postfix(loss=f'{loss.item():.3f}')
             if args.debug and i >= 5: break
         sched.step()
         train_loss = loss_sum / loss_n
