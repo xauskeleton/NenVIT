@@ -518,6 +518,10 @@ def main():
     p.add_argument('--debug', action='store_true',
                    help='Quick mode: 1 epoch, 1 FIM batch, tiny val eval')
     p.add_argument('--out-dir', type=str, default=str(PROJECT_ROOT / 'checkpoints' / 'qat'))
+    p.add_argument('--resume', type=str, default='',
+                   help='Path to last.pth checkpoint to resume from (model+opt+sched+scaler+epoch). '
+                        'Use to recover after Kaggle session timeout. Mask is re-derived from '
+                        'the saved checkpoint, so --binary-ratio/--apb-scope must match the original run.')
     args = p.parse_args()
 
     if args.debug:
@@ -604,11 +608,27 @@ def main():
     use_amp = bool(args.amp) and device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
+    start_epoch = 0
+    if args.resume:
+        ck = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ck['model'])
+        opt.load_state_dict(ck['opt'])
+        sched.load_state_dict(ck['sched'])
+        if use_amp and 'scaler' in ck:
+            scaler.load_state_dict(ck['scaler'])
+        start_epoch = ck['epoch'] + 1
+        best_top1 = ck.get('best_top1', 0.0)
+        print(f'>>> Resumed from {args.resume}: epoch {ck["epoch"]+1}/{args.epochs}, '
+              f'best_top1={best_top1:.2f}%')
+        if start_epoch >= args.epochs:
+            print(f'>>> Already finished ({start_epoch} >= {args.epochs}). Nothing to do.')
+            return
+
     print(f'='*60)
-    print(f'QAT training: {args.epochs} epochs, lr={args.lr}, '
+    print(f'QAT training: {args.epochs} epochs (start={start_epoch}), lr={args.lr}, '
           f'freeze α at epoch {freeze_at}, dplr={dplr is not None}, amp={use_amp}')
     print(f'='*60)
-    for ep in range(args.epochs):
+    for ep in range(start_epoch, args.epochs):
         # Periodic FIM recompute + mask refresh
         if (args.recompute_fim_every > 0 and ep > 0
                 and ep % args.recompute_fim_every == 0):
@@ -687,6 +707,16 @@ def main():
         if t1 > best_top1:
             best_top1 = t1
             torch.save(model.state_dict(), out_dir / 'best.pth')
+
+        # Save resumable checkpoint every epoch
+        torch.save({
+            'epoch': ep,
+            'model': model.state_dict(),
+            'opt': opt.state_dict(),
+            'sched': sched.state_dict(),
+            'scaler': scaler.state_dict() if use_amp else None,
+            'best_top1': best_top1,
+        }, out_dir / 'last.pth')
 
     print(f'='*60)
     print(f'DONE. Best val top1 = {best_top1:.2f}%')
