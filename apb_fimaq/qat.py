@@ -63,6 +63,7 @@ class _APBSTE(torch.autograd.Function):
     to correctly propagate both gradients separately.
     """
     @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(ctx, w, alpha, mask):
         binary = alpha * torch.sign(w)
         out = torch.where(mask, binary, w)
@@ -70,6 +71,7 @@ class _APBSTE(torch.autograd.Function):
         return out
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_out):
         w, mask = ctx.saved_tensors
         grad_w = grad_out                                          # STE identity
@@ -509,6 +511,9 @@ def main():
                    help='Weight for DPLR loss vs CE loss (default 1.0). '
                         'total = CE + lambda · Σ_blocks L_DPLR')
     p.add_argument('--num-workers', type=int, default=2)
+    p.add_argument('--amp', action='store_true',
+                   help='Enable CUDA mixed-precision (fp16) training. '
+                        '1.5-2x speedup on T4/RTX, slight memory savings.')
     p.add_argument('--seed', type=int, default=3407)
     p.add_argument('--debug', action='store_true',
                    help='Quick mode: 1 epoch, 1 FIM batch, tiny val eval')
@@ -596,9 +601,12 @@ def main():
     best_top1 = 0.0
     freeze_at = max(args.epochs // 2, 1)
 
+    use_amp = bool(args.amp) and device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
     print(f'='*60)
     print(f'QAT training: {args.epochs} epochs, lr={args.lr}, '
-          f'freeze α at epoch {freeze_at}, dplr={dplr is not None}')
+          f'freeze α at epoch {freeze_at}, dplr={dplr is not None}, amp={use_amp}')
     print(f'='*60)
     for ep in range(args.epochs):
         # Periodic FIM recompute + mask refresh
@@ -632,23 +640,25 @@ def main():
 
             if dplr is not None:
                 dplr.clear_caches()
-                with torch.no_grad():
+                with torch.no_grad(), torch.amp.autocast('cuda', enabled=use_amp):
                     _ = dplr.model_fp(x)        # populates z_fp_cache
 
-            logits = model(x)                    # populates z_apb_cache (if hooks installed)
-            loss_ce = crit(logits, y)
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                logits = model(x)                # populates z_apb_cache (if hooks installed)
+                loss_ce = crit(logits, y)
 
-            loss_dplr_val = 0.0
-            if dplr is not None:
-                loss_dplr = dplr.compute()
-                loss = loss_ce + args.dplr_lambda * loss_dplr
-                loss_dplr_val = loss_dplr.detach().item()
-                dplr_sum += loss_dplr_val * y.size(0)
-            else:
-                loss = loss_ce
+                loss_dplr_val = 0.0
+                if dplr is not None:
+                    loss_dplr = dplr.compute()
+                    loss = loss_ce + args.dplr_lambda * loss_dplr
+                    loss_dplr_val = loss_dplr.detach().item()
+                    dplr_sum += loss_dplr_val * y.size(0)
+                else:
+                    loss = loss_ce
 
-            loss.backward()
-            opt.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             loss_sum += loss.item() * y.size(0)
             ce_sum   += loss_ce.item() * y.size(0)
             loss_n   += y.size(0)
