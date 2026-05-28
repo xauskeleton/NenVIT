@@ -511,9 +511,9 @@ def main():
                    help='Weight for DPLR loss vs CE loss (default 1.0). '
                         'total = CE + lambda · Σ_blocks L_DPLR')
     p.add_argument('--num-workers', type=int, default=2)
-    p.add_argument('--amp', action='store_true',
-                   help='Enable CUDA mixed-precision (fp16) training. '
-                        '1.5-2x speedup on T4/RTX, slight memory savings.')
+    p.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True,
+                   help='CUDA mixed-precision (fp16) training. On by default '
+                        '(1.5-2x speedup on T4/RTX). Disable with --no-amp.')
     p.add_argument('--seed', type=int, default=3407)
     p.add_argument('--debug', action='store_true',
                    help='Quick mode: 1 epoch, 1 FIM batch, tiny val eval')
