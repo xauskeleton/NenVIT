@@ -27,9 +27,11 @@ USAGE
     python qat.py --debug                      # 1 epoch, k=1, smoke test
 """
 import argparse
+import math
 import sys
 from tqdm.auto import tqdm
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +44,27 @@ import timm
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))
 from tiny_imagenet_loader import TinyImageNetLoaderGenerator  # noqa: E402
+from imagenet1k_loader import ImageNet1kLoaderGenerator  # noqa: E402
+
+
+class _Tee:
+    """Mirror writes to a file in addition to the original stream.
+
+    tqdm writes to stderr by default, so teeing stdout keeps the log file
+    free of progress-bar carriage-return spam — only print()s land in it.
+    """
+    def __init__(self, stream, fp):
+        self.stream = stream
+        self.fp = fp
+    def write(self, s):
+        self.stream.write(s)
+        self.fp.write(s)
+        self.fp.flush()
+    def flush(self):
+        self.stream.flush()
+        self.fp.flush()
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 # ============================================================
@@ -108,9 +131,20 @@ class APBLinear(nn.Module):
     def binary_ratio(self) -> float:
         return self.mask.float().mean().item()
 
-    def storage_bits_per_weight(self) -> float:
+    def storage_bits_per_weight(self, b_v: int = 32) -> float:
+        """Avg bits/weight per APB paper Eq 10:
+            Mem(W) = (n-s)·1 + s·(b_v + b_p) bits
+        where:
+            n   = layer size (out × in)
+            s   = #FP entries = (1-p)·n
+            b_v = FP value bit-width (32 default, matches paper)
+            b_p = ⌈log₂(n-1)⌉ + 1 bits per FP position index
+        """
         p = self.binary_ratio
-        return 1.0 * p + 32.0 * (1.0 - p)
+        n = self.in_features * self.out_features
+        b_p = math.ceil(math.log2(max(n - 1, 2))) + 1
+        s = round((1 - p) * n)
+        return ((n - s) + s * (b_v + b_p)) / n
 
 
 # ============================================================
@@ -471,6 +505,93 @@ def avg_apb_stats(model):
     return len(layers), rb, bits
 
 
+def pack_apb_state_dict(model, fp_dtype='fp32'):
+    """Pack per APB paper Eq 10 + Fig 2 (right):
+        For each APB layer:
+          binary_signs_packed: (n-s) × 1 bit, packed to uint8.
+              Signs of weights at *non-FP positions only*, in canonical row-major order
+              (skipping positions listed in fp_positions). Sign bit 1 → +α, 0 → -α.
+          fp_positions: int32 array (s entries) — flat row-major indices of FP weights.
+          fp_values:    fp_dtype array (s entries) — FP values at those positions.
+          alpha:        scalar.
+
+        Non-APB params (LN, biases of non-APB layers, head if scope=skip) saved as fp_dtype.
+
+    Total bits = (n-s) + s·(b_v + b_p) + 32  per layer  (paper Eq 10).
+    Position list (paper's choice) is more compact than bitmap mask when p < ~0.96.
+    """
+    fp_torch_dtype = torch.float16 if fp_dtype == 'fp16' else torch.float32
+    packed = {'_apb_layers': {}, '_other': {}, '_meta': {'fp_dtype': fp_dtype}}
+
+    for name, m in model.named_modules():
+        if isinstance(m, APBLinear):
+            w_flat = m.latent_weight.detach().cpu().view(-1)
+            mask_flat = m.mask.detach().cpu().view(-1)
+            shape = (m.out_features, m.in_features)
+
+            fp_positions = torch.nonzero(~mask_flat, as_tuple=False).view(-1).to(torch.int32)
+            fp_values = w_flat[~mask_flat].to(fp_torch_dtype)
+
+            binary_signs = (w_flat[mask_flat] > 0).to(torch.uint8).numpy()
+            binary_signs_packed = np.packbits(binary_signs)
+
+            packed['_apb_layers'][name] = {
+                'shape': shape,
+                'binary_signs_packed': torch.from_numpy(binary_signs_packed),
+                'n_binary': int(mask_flat.sum().item()),  # to truncate packbits padding on unpack
+                'fp_positions': fp_positions,
+                'fp_values': fp_values,
+                'alpha': float(m.alpha.detach().abs().item()),
+                'bias': m.bias.detach().to(fp_torch_dtype).cpu() if m.bias is not None else None,
+            }
+
+    apb_param_names = set()
+    for name, mod in model.named_modules():
+        if isinstance(mod, APBLinear):
+            apb_param_names.add(f'{name}.latent_weight')
+            apb_param_names.add(f'{name}.alpha')
+            apb_param_names.add(f'{name}.mask')
+            if mod.bias is not None:
+                apb_param_names.add(f'{name}.bias')
+
+    for name, tensor in model.state_dict().items():
+        if name in apb_param_names:
+            continue
+        packed['_other'][name] = tensor.detach().to(fp_torch_dtype).cpu()
+
+    return packed
+
+
+def packed_theoretical_bits(model, b_v: int = 32) -> dict:
+    """Total bits per paper Eq 10, summed across APB layers only.
+
+    Returns dict with per-layer + aggregate eff_bits/MB so the report
+    matches paper Table II-III exactly (b_v=32 by default).
+    """
+    total_n = 0
+    total_bits = 0
+    per_layer = {}
+    for name, m in model.named_modules():
+        if isinstance(m, APBLinear):
+            n = m.in_features * m.out_features
+            b_p = math.ceil(math.log2(max(n - 1, 2))) + 1
+            s = int((~m.mask).sum().item())
+            layer_bits = (n - s) + s * (b_v + b_p) + 32  # +32 for alpha scalar
+            per_layer[name] = {
+                'n': n, 's': s, 'b_p': b_p, 'bits': layer_bits,
+                'bits_per_weight': layer_bits / n,
+            }
+            total_n += n
+            total_bits += layer_bits
+    return {
+        'per_layer': per_layer,
+        'total_n_weights': total_n,
+        'total_bits': total_bits,
+        'avg_bits_per_weight': total_bits / max(total_n, 1),
+        'apb_layers_MB': total_bits / 8 / 1e6,
+    }
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -510,6 +631,14 @@ def main():
     p.add_argument('--dplr-lambda', type=float, default=1.0,
                    help='Weight for DPLR loss vs CE loss (default 1.0). '
                         'total = CE + lambda · Σ_blocks L_DPLR')
+    p.add_argument('--dataset', choices=['tiny', 'imagenet1k'], default='tiny',
+                   help='"tiny" (default) = HF tiny-imagenet, 91k/9.1k after IN-1k remap, '
+                        '~22 min/epoch on T4. '
+                        '"imagenet1k" = full ImageNet-1k from --data-dir (ImageFolder layout), '
+                        '~5h/epoch on T4 → only viable for PTQ or few-epoch QAT.')
+    p.add_argument('--data-dir', type=str, default='',
+                   help='Root dir for ImageNet-1k (must contain train/ and val/ ImageFolder layout). '
+                        'Required when --dataset=imagenet1k. Ignored for --dataset=tiny.')
     p.add_argument('--num-workers', type=int, default=2)
     p.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True,
                    help='CUDA mixed-precision (fp16) training. On by default '
@@ -518,10 +647,21 @@ def main():
     p.add_argument('--debug', action='store_true',
                    help='Quick mode: 1 epoch, 1 FIM batch, tiny val eval')
     p.add_argument('--out-dir', type=str, default=str(PROJECT_ROOT / 'checkpoints' / 'qat'))
+    p.add_argument('--log-file', type=str, default='',
+                   help='Path to log file. Default: <out_dir>/train.log. '
+                        'Opened in append mode so resumed runs continue the same log. '
+                        'Pass "none" to disable file logging.')
     p.add_argument('--resume', type=str, default='',
                    help='Path to last.pth checkpoint to resume from (model+opt+sched+scaler+epoch). '
                         'Use to recover after Kaggle session timeout. Mask is re-derived from '
                         'the saved checkpoint, so --binary-ratio/--apb-scope must match the original run.')
+    p.add_argument('--export-packed', action=argparse.BooleanOptionalAction, default=True,
+                   help='After training, also save best_packed.pt in paper format (Eq 10): '
+                        '(n-s) binary signs + (fp_position, fp_value) pairs + α per layer. '
+                        'Use --no-export-packed to disable.')
+    p.add_argument('--packed-fp-dtype', choices=['fp32', 'fp16'], default='fp32',
+                   help='Bit-width for FP zone values in packed file. fp32 matches paper Eq 10 '
+                        '(b_v=32) exactly; fp16 halves the file size.')
     args = p.parse_args()
 
     if args.debug:
@@ -532,13 +672,30 @@ def main():
     torch.manual_seed(args.seed); np.random.seed(args.seed); torch.cuda.manual_seed_all(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # ----- Log file (tee stdout) -----
+    log_path = args.log_file or str(out_dir / 'train.log')
+    if log_path.lower() != 'none':
+        log_fp = open(log_path, 'a', buffering=1, encoding='utf-8')
+        sys.stdout = _Tee(sys.stdout, log_fp)
+        print(f'\n[{datetime.now():%Y-%m-%d %H:%M:%S}] ===== run start (log → {log_path}) =====')
+
     print(f'='*60)
     print(f'APB QAT on Swin-S | device={device}')
     print(f'Args: {vars(args)}')
     print(f'='*60)
 
     # ----- Data -----
-    g = TinyImageNetLoaderGenerator(val_batch_size=args.batch_size, num_workers=args.num_workers)
+    if args.dataset == 'tiny':
+        g = TinyImageNetLoaderGenerator(val_batch_size=args.batch_size,
+                                         num_workers=args.num_workers)
+    elif args.dataset == 'imagenet1k':
+        if not args.data_dir:
+            raise ValueError('--data-dir is required when --dataset=imagenet1k')
+        g = ImageNet1kLoaderGenerator(data_dir=args.data_dir,
+                                       val_batch_size=args.batch_size,
+                                       num_workers=args.num_workers)
+    else:
+        raise ValueError(f'unknown dataset {args.dataset!r}')
     train_loader = torch.utils.data.DataLoader(
         g.train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True)
@@ -721,6 +878,28 @@ def main():
     print(f'='*60)
     print(f'DONE. Best val top1 = {best_top1:.2f}%')
     print(f'='*60)
+
+    # ----- Optional packed export (paper Eq 10 / Fig 2 format) -----
+    if args.export_packed:
+        best_pth = out_dir / 'best.pth'
+        if best_pth.exists():
+            model.load_state_dict(torch.load(best_pth, map_location=device))
+        b_v_paper = 32 if args.packed_fp_dtype == 'fp32' else 16
+        report = packed_theoretical_bits(model, b_v=b_v_paper)
+        packed = pack_apb_state_dict(model, fp_dtype=args.packed_fp_dtype)
+        packed_path = out_dir / 'best_packed.pt'
+        torch.save(packed, packed_path)
+        fp32_bytes = best_pth.stat().st_size if best_pth.exists() else 0
+        packed_bytes = packed_path.stat().st_size
+        print(f'='*60)
+        print(f'Packed export (paper Eq 10 format, b_v={b_v_paper}): {packed_path}')
+        print(f'  Theoretical (APB layers only): {report["avg_bits_per_weight"]:.2f} bits/weight '
+              f'→ {report["apb_layers_MB"]:.1f} MB')
+        print(f'  Actual file: best_packed.pt = {packed_bytes/1e6:.1f} MB '
+              f'(incl. non-APB params: LN, biases, head if scope=skip)')
+        print(f'  best.pth (training FP32):     {fp32_bytes/1e6:.1f} MB')
+        print(f'  Compression vs best.pth: {fp32_bytes/max(packed_bytes,1):.1f}×')
+        print(f'='*60)
 
 
 if __name__ == '__main__':
