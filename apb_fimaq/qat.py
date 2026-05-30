@@ -43,8 +43,34 @@ import timm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))
-from tiny_imagenet_loader import TinyImageNetLoaderGenerator  # noqa: E402
-from imagenet1k_loader import ImageNet1kLoaderGenerator  # noqa: E402
+# Data loaders are imported lazily inside main() per --dataset, so that e.g. a
+# CIFAR run does not require HuggingFace `datasets` (needed only by the tiny loader).
+
+# Finetuned FP baseline. QAT initialises from this (if present & shape-compatible)
+# instead of raw timm-pretrained weights, so quantization starts from a model that is
+# already trained for the target dataset (e.g. the CIFAR head is no longer random).
+DEFAULT_INIT_CKPT = PROJECT_ROOT / 'ckpt' / 'best.pth'
+
+
+def init_from_baseline(model):
+    """Load DEFAULT_INIT_CKPT into `model` in-place if it exists and fits.
+
+    Returns 'loaded' on success, 'none' if no checkpoint file, or 'mismatch' if the
+    saved weights are shape-incompatible (e.g. ckpt is cifar100/100-class but the run
+    is tiny/1000-class) — in which case the model keeps its timm-pretrained weights.
+    """
+    if not DEFAULT_INIT_CKPT.exists():
+        return 'none'
+    sd = torch.load(DEFAULT_INIT_CKPT, map_location='cpu')
+    if isinstance(sd, dict) and 'model' in sd:   # tolerate a last.pth-style checkpoint
+        sd = sd['model']
+    try:
+        model.load_state_dict(sd, strict=True)
+        return 'loaded'
+    except RuntimeError as e:
+        print(f'!! {DEFAULT_INIT_CKPT.name} incompatible with current model, keeping '
+              f'timm-pretrained: {str(e).splitlines()[0]}')
+        return 'mismatch'
 
 
 class _Tee:
@@ -631,11 +657,15 @@ def main():
     p.add_argument('--dplr-lambda', type=float, default=1.0,
                    help='Weight for DPLR loss vs CE loss (default 1.0). '
                         'total = CE + lambda · Σ_blocks L_DPLR')
-    p.add_argument('--dataset', choices=['tiny', 'imagenet1k'], default='tiny',
+    p.add_argument('--dataset', choices=['tiny', 'imagenet1k', 'cifar10', 'cifar100'],
+                   default='tiny',
                    help='"tiny" (default) = HF tiny-imagenet, 91k/9.1k after IN-1k remap, '
                         '~22 min/epoch on T4. '
                         '"imagenet1k" = full ImageNet-1k from --data-dir (ImageFolder layout), '
-                        '~5h/epoch on T4 → only viable for PTQ or few-epoch QAT.')
+                        '~5h/epoch on T4 → only viable for PTQ or few-epoch QAT. '
+                        '"cifar10"/"cifar100" = torchvision (auto-download, no HF datasets), '
+                        '32px upsampled to 224; head re-created for 10/100 classes so the '
+                        'FP baseline starts near-random and must be trained.')
     p.add_argument('--data-dir', type=str, default='',
                    help='Root dir for ImageNet-1k (must contain train/ and val/ ImageFolder layout). '
                         'Required when --dataset=imagenet1k. Ignored for --dataset=tiny.')
@@ -684,16 +714,26 @@ def main():
     print(f'Args: {vars(args)}')
     print(f'='*60)
 
-    # ----- Data -----
+    # ----- Data (loaders imported lazily so CIFAR doesn't pull HF `datasets`) -----
     if args.dataset == 'tiny':
+        from tiny_imagenet_loader import TinyImageNetLoaderGenerator
         g = TinyImageNetLoaderGenerator(val_batch_size=args.batch_size,
                                          num_workers=args.num_workers)
+        num_classes = 1000  # tiny labels remapped onto IN-1k head
     elif args.dataset == 'imagenet1k':
         if not args.data_dir:
             raise ValueError('--data-dir is required when --dataset=imagenet1k')
+        from imagenet1k_loader import ImageNet1kLoaderGenerator
         g = ImageNet1kLoaderGenerator(data_dir=args.data_dir,
                                        val_batch_size=args.batch_size,
                                        num_workers=args.num_workers)
+        num_classes = 1000
+    elif args.dataset in ('cifar10', 'cifar100'):
+        from cifar_loader import CifarLoaderGenerator
+        g = CifarLoaderGenerator(which=args.dataset, data_dir=args.data_dir,
+                                 val_batch_size=args.batch_size,
+                                 num_workers=args.num_workers)
+        num_classes = g.num_classes
     else:
         raise ValueError(f'unknown dataset {args.dataset!r}')
     train_loader = torch.utils.data.DataLoader(
@@ -705,8 +745,14 @@ def main():
         num_workers=args.num_workers)
 
     # ----- Model -----
-    print('Loading Swin-S pretrained ...')
-    model = timm.create_model('swin_small_patch4_window7_224', pretrained=True)
+    print(f'Loading Swin-S pretrained (num_classes={num_classes}) ...')
+    model = timm.create_model('swin_small_patch4_window7_224', pretrained=True,
+                              num_classes=num_classes)
+    status = init_from_baseline(model)
+    if status == 'loaded':
+        print(f'>>> Initialised from finetuned FP baseline: {DEFAULT_INIT_CKPT}')
+    elif status == 'none':
+        print(f'>>> No {DEFAULT_INIT_CKPT} — using timm-pretrained weights.')
     model.to(device).eval()
 
     # FP baseline
@@ -740,7 +786,9 @@ def main():
     dplr = None
     if args.use_dplr_loss:
         print('Setting up DPLR-FIM per-block loss (FP teacher + FIM init) ...')
-        model_fp = timm.create_model('swin_small_patch4_window7_224', pretrained=True)
+        model_fp = timm.create_model('swin_small_patch4_window7_224', pretrained=True,
+                                     num_classes=num_classes)
+        init_from_baseline(model_fp)   # teacher must match the student's init
         model_fp.to(device).eval()
         dplr = DPLRBlockLoss(model_fp, k=args.fim_batches,
                              p1=args.fim_p1, p2=args.fim_p2)
