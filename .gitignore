@@ -4,7 +4,9 @@
 
 # Trained checkpoints (too large, 100MB+)
 checkpoints/
+ckpt/
 *.pth
+*.pt
 *.bin
 *.safetensors
 
@@ -54,3 +56,15 @@ _scratch*.py
 # Output artifacts of analysis scripts
 scripts/fim_weight.pt
 apb_fimaq/_test_*.py
+
+# Third-party FIMA-Q repo (cloned separately, kept pristine; re-clone from
+# https://github.com/ShiheWang/FIMA-Q). apb_fimaq/fimaq_ptq_cifar.py imports it.
+FIMA-Q/
+
+# Auto-downloaded datasets + scratch test logs
+data/
+runs_test/
+
+# Stray images
+*.jpg
+*.jpeg
