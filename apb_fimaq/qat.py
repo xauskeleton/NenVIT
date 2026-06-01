@@ -618,6 +618,36 @@ def packed_theoretical_bits(model, b_v: int = 32) -> dict:
     }
 
 
+def actual_effective_bits(packed: dict, file_bytes: int) -> dict:
+    """ACTUAL bits/weight measured from the packed dict + on-disk file size.
+
+    Unlike packed_theoretical_bits (paper Eq 10, b_p-bit positions, APB-only),
+    this reflects what was REALLY written:
+      - apb_zone_bpw : bytes of the _apb_layers tensors only ÷ APB weights.
+                       Higher than the 'theoretical' number because fp_positions
+                       are stored as int32 (32 bit) instead of b_p≈20 bit.
+      - whole_bpw    : full file size × 8 ÷ ALL model weights (APB + _other).
+                       This is the honest "how many bits/weight did we ship",
+                       and it DOES change with --apb-scope (skip keeps the 3
+                       downsample.reduction layers as fp32 in _other).
+    """
+    def _nbytes(t):
+        return t.numel() * t.element_size() if torch.is_tensor(t) else 0
+
+    apb_w = sum(L['shape'][0] * L['shape'][1] for L in packed['_apb_layers'].values())
+    apb_bytes = sum(_nbytes(v) for L in packed['_apb_layers'].values()
+                    for v in L.values())
+    other_w = sum(t.numel() for t in packed['_other'].values() if torch.is_tensor(t))
+    total_w = apb_w + other_w
+    return {
+        'apb_weights': apb_w,
+        'other_weights': other_w,
+        'total_weights': total_w,
+        'apb_zone_bpw': apb_bytes * 8 / max(apb_w, 1),
+        'whole_bpw': file_bytes * 8 / max(total_w, 1),
+    }
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -658,7 +688,7 @@ def main():
                    help='Weight for DPLR loss vs CE loss (default 1.0). '
                         'total = CE + lambda · Σ_blocks L_DPLR')
     p.add_argument('--dataset', choices=['tiny', 'imagenet1k', 'cifar10', 'cifar100'],
-                   default='tiny',
+       default='tiny',
                    help='"tiny" (default) = HF tiny-imagenet, 91k/9.1k after IN-1k remap, '
                         '~22 min/epoch on T4. '
                         '"imagenet1k" = full ImageNet-1k from --data-dir (ImageFolder layout), '
@@ -939,14 +969,17 @@ def main():
         torch.save(packed, packed_path)
         fp32_bytes = best_pth.stat().st_size if best_pth.exists() else 0
         packed_bytes = packed_path.stat().st_size
+        act = actual_effective_bits(packed, packed_bytes)
         print(f'='*60)
         print(f'Packed export (paper Eq 10 format, b_v={b_v_paper}): {packed_path}')
-        print(f'  Theoretical (APB layers only): {report["avg_bits_per_weight"]:.2f} bits/weight '
-              f'→ {report["apb_layers_MB"]:.1f} MB')
+        print(f'  >> Effective bit (WHOLE model): {act["whole_bpw"]:.2f} bits/weight '
+              f'over {act["total_weights"]/1e6:.1f}M params')
         print(f'  Actual file: best_packed.pt = {packed_bytes/1e6:.1f} MB '
-              f'(incl. non-APB params: LN, biases, head if scope=skip)')
-        print(f'  best.pth (training FP32):     {fp32_bytes/1e6:.1f} MB')
-        print(f'  Compression vs best.pth: {fp32_bytes/max(packed_bytes,1):.1f}×')
+              f'(incl. non-APB params fp32: LN, biases, head/downsample if scope=skip)')
+        print(f'  best.pth (training FP32): {fp32_bytes/1e6:.1f} MB '
+              f'| Compression: {fp32_bytes/max(packed_bytes,1):.1f}×')
+        print(f'  (paper-compare only — Eq10 theoretical, APB layers: '
+              f'{report["avg_bits_per_weight"]:.2f} bits/weight)')
         print(f'='*60)
 
 
