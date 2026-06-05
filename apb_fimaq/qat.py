@@ -128,6 +128,56 @@ class _APBSTE(torch.autograd.Function):
         return grad_w, grad_alpha, None                            # mask: no grad
 
 
+# ============================================================
+# ACTIVATION QUANT — LSQ (Esser et al. 2020), learnable step + STE
+# ============================================================
+def _round_ste(x):
+    """round() with a straight-through-estimator gradient (∂/∂x = 1)."""
+    return (x.round() - x).detach() + x
+
+
+def _grad_scale(x, scale):
+    """Identity in forward; scales the gradient flowing into x by `scale`.
+    LSQ trick to dampen the step-size gradient (g = 1/sqrt(N·Qp))."""
+    return (x - x * scale).detach() + x * scale
+
+
+class LSQActQuant(nn.Module):
+    """Learned Step Size Quantization for activations (signed symmetric).
+
+        x_q = round(clip(x / s, Qn, Qp)) · s,   Qn = -2^(b-1), Qp = 2^(b-1)-1
+
+    One learnable step `s` per quantizer. The autograd-friendly
+    _round_ste + _grad_scale form reproduces the exact LSQ gradient w.r.t. s
+    (round(x/s) - x/s in-range, Qn/Qp out-of-range); gradient w.r.t. x is the
+    STE identity inside the clip range and 0 outside. `s` is lazily initialised
+    from the first batch (2·E|x|/√Qp), on train OR eval, via the `initialized`
+    buffer — so the pre-QAT eval already uses a sane step.
+
+    Signed symmetric (ViT activations after LN/GELU are two-sided). b>=32 → no-op.
+    """
+    def __init__(self, n_bits: int):
+        super().__init__()
+        self.n_bits = n_bits
+        self.Qn = -(2 ** (n_bits - 1))
+        self.Qp = 2 ** (n_bits - 1) - 1
+        self.step = nn.Parameter(torch.ones(1))
+        self.register_buffer('initialized', torch.zeros(1, dtype=torch.uint8))
+
+    @torch.no_grad()
+    def _init_step(self, x):
+        self.step.copy_(2 * x.detach().float().abs().mean() / math.sqrt(max(self.Qp, 1)))
+        self.initialized.fill_(1)
+
+    def forward(self, x):
+        if self.n_bits >= 32:
+            return x
+        if self.initialized.item() == 0:
+            self._init_step(x)
+        s = _grad_scale(self.step, 1.0 / math.sqrt(max(x.numel() * self.Qp, 1)))
+        return _round_ste(torch.clamp(x / s, self.Qn, self.Qp)) * s
+
+
 class APBLinear(nn.Module):
     """nn.Linear wrapper with APB partition.
 
@@ -136,7 +186,7 @@ class APBLinear(nn.Module):
         mask[i,j] = False  →  w_ij                  (FP32, learnable)
     Backward: STE — both α and latent_weight receive correct gradients.
     """
-    def __init__(self, linear: nn.Linear, mask: torch.Tensor):
+    def __init__(self, linear: nn.Linear, mask: torch.Tensor, act_bits: int = 0):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
@@ -146,8 +196,12 @@ class APBLinear(nn.Module):
         self.alpha = nn.Parameter(self.latent_weight.detach().abs().mean())
         # Mask: True = binary. Frozen throughout training.
         self.register_buffer('mask', mask.bool())
+        # Optional LSQ activation fake-quant on this layer's INPUT (0/32 = off).
+        self.act_quant = LSQActQuant(act_bits) if (act_bits and act_bits < 32) else None
 
     def forward(self, x):
+        if self.act_quant is not None:
+            x = self.act_quant(x)
         # alpha.abs() to keep binary magnitude positive (paper convention).
         # Grad flows correctly through abs (sign(alpha) backward).
         eff_w = _APBSTE.apply(self.latent_weight, self.alpha.abs(), self.mask)
@@ -303,8 +357,9 @@ compute_weight_fim = compute_weight_dplr_fim
 # ============================================================
 # APPLY APB (replace nn.Linear → APBLinear)
 # ============================================================
-def apply_apb(model, fim_dict, binary_ratio, device, scope='skip'):
-    """Wrap each target Linear with APBLinear using FIM-percentile mask."""
+def apply_apb(model, fim_dict, binary_ratio, device, scope='skip', act_bits=0):
+    """Wrap each target Linear with APBLinear using FIM-percentile mask.
+    act_bits: LSQ activation bit-width on each wrapped layer's input (0/32 = off)."""
     targets = get_target_layers(model, scope=scope)
     for name, mod in targets.items():
         if isinstance(mod, APBLinear):
@@ -312,7 +367,7 @@ def apply_apb(model, fim_dict, binary_ratio, device, scope='skip'):
         fim = fim_dict[name]
         tau = torch.quantile(fim.flatten().float(), binary_ratio)
         mask = (fim < tau)
-        new_layer = APBLinear(mod, mask=mask).to(device)
+        new_layer = APBLinear(mod, mask=mask, act_bits=act_bits).to(device)
         # Reassign in parent
         parent = model
         parts = name.split('.')
@@ -660,6 +715,11 @@ def main():
                    help='Layer scope for APB. '
                         '"skip" = 96 Linears (default; safe, skips head + 3 downsample + patch_embed). '
                         '"full" = 100 Linears (aggressive; includes head.fc + downsample.reduction).')
+    p.add_argument('--act-bits', type=int, default=0,
+                   help='Activation quant bit-width (LSQ, signed symmetric, learnable step) on the '
+                        'INPUT activations of each APB Linear. 0 or 32 = OFF (weight-only APB, '
+                        'default, backward-compatible). Verify at 8 first, then sweep 4/2. '
+                        '1-bit is degenerate (Qp=0) and not recommended.')
     p.add_argument('--epochs', type=int, default=10)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--batch-size', type=int, default=64)
@@ -803,10 +863,16 @@ def main():
           f'(scope={args.apb_scope})')
 
     # ----- Apply APB -----
-    print(f'Applying APB (scope={args.apb_scope}, binary_ratio={args.binary_ratio}) ...')
-    model = apply_apb(model, fim_dict, args.binary_ratio, device, scope=args.apb_scope)
+    print(f'Applying APB (scope={args.apb_scope}, binary_ratio={args.binary_ratio}, '
+          f'act_bits={args.act_bits or "off"}) ...')
+    model = apply_apb(model, fim_dict, args.binary_ratio, device, scope=args.apb_scope,
+                      act_bits=args.act_bits)
     nl, rb, bits = avg_apb_stats(model)
     print(f'APB: {nl} layers wrapped | avg binary={rb:.3f} | avg eff_bits={bits:.2f}')
+    n_actq = sum(1 for m in model.modules() if isinstance(m, LSQActQuant))
+    if n_actq:
+        print(f'Activation quant: LSQ {args.act_bits}-bit (signed) on {n_actq} '
+              f'APB-Linear inputs')
 
     # Eval right after APB (before training)
     t1, t5, n = evaluate(model, val_loader, device, max_batches=max_b)
@@ -829,11 +895,14 @@ def main():
     # ----- QAT -----
     # Paper APB convention: weight_decay applies to weights/bias only, NOT to α.
     # Excluding α prevents WD from pulling it toward 0 (which would kill binary magnitude).
-    alpha_params  = [p for n, p in model.named_parameters() if 'alpha' in n]
-    other_params  = [p for n, p in model.named_parameters() if 'alpha' not in n]
+    # No weight-decay on α (binary magnitude) nor on the LSQ activation step.
+    def _is_nowd(n):
+        return 'alpha' in n or 'act_quant.step' in n
+    nowd_params  = [p for n, p in model.named_parameters() if _is_nowd(n)]
+    other_params = [p for n, p in model.named_parameters() if not _is_nowd(n)]
     opt = optim.AdamW([
         {'params': other_params, 'weight_decay': 1e-4},
-        {'params': alpha_params, 'weight_decay': 0.0},
+        {'params': nowd_params, 'weight_decay': 0.0},
     ], lr=args.lr)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     crit = nn.CrossEntropyLoss()

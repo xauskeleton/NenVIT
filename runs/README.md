@@ -3,6 +3,62 @@
 Mỗi run lưu thành 1 file markdown gồm config + per-epoch metrics + observations.
 Đặt tên: `<date>_<model>_br<ratio>_<scope>_<extra>.md`.
 
+---
+
+# Structural pruning (Swin-S / CIFAR-100) — nhánh `feat/structural-pruning`
+
+Khác hẳn nhóm APB QAT (C1–C8 bên dưới): đây là **structural pruning** (bỏ head/MLP channel theo
+DPLR-FIM importance, lowest-FIM dropped), KHÔNG quantize. Script `apb_fimaq/prune_swin_cifar.py`.
+Init từ CIFAR baseline `ckpt/best.pth` → **FP baseline = 90.88%** (mốc so prune cost).
+Chung: CIFAR-100, fim_batches=10, lr=1e-4, bs=64, AMP, seed=3407, wd=1e-4, label_smoothing=0.1.
+
+Tất cả: 20 ep, post-prune top-1 = trước finetune (xem file run). prune cost = best top-1 − 90.88%.
+
+| #  | mode       | head/mlp | heads     | mlp ch.        | params (M)            | post-prune | **Best top-1** | prune cost  | file |
+| -- | ---------- | -------- | --------- | -------------- | --------------------- | ---------- | -------------- | ----------- | ---- |
+| FP | —          | —        | 282       | 36096          | 48.91                 | —          | **90.88%**     | (baseline)  | `2026-05-30_..._FP_baseline_finetune.md` |
+| P1 | **global** | 0.5      | 282 → 141 | 36096 → 18048  | **23.06** (−52.9%)    | 19.08%     | **90.87%**     | **−0.01%**  | `..._prune_head0.5_mlp0.5_global.md` |
+| P2 | per_layer  | 0.5      | 282 → 142 | 36096 → 18048  | **25.32** (−48.2%)    | 7.01%      | **90.55%**     | −0.33%      | `..._prune_head0.5_mlp0.5_perlayer.md` |
+| P3 | **global** | 0.7      | 282 → 85  | 36096 → 10829  | **14.27** (−70.8%)    | 2.05%      | **87.80%**     | −3.08%      | `..._prune_head0.7_mlp0.7_global.md` |
+| P4 | per_layer  | 0.7      | 282 → 92  | 36096 → 10832  | **16.19** (−66.9%)    | 1.30%      | **87.85%**     | −3.03%      | `..._prune_head0.7_mlp0.7_perlayer.md` |
+| P5 | **global** | 0.9      | 282 → 28  | 36096 → 3610   | **5.97** (−87.8%)     | 1.03%      | **63.00%**     | −27.88%     | `..._prune_head0.9_mlp0.9_global.md` |
+| P6 | per_layer  | 0.9      | 282 → 26  | 36096 → 3616   | **6.20** (−87.3%)     | 1.00%      | **60.64%**     | −30.24%     | `..._prune_head0.9_mlp0.9_perlayer.md` |
+
+(mọi run: rank-mode global dùng `--global-metric per_param --mlp-keep-frac 0.05`; FIM=DPLR, seed 3407.)
+
+**So sánh global vs per_layer (cùng ratio):**
+
+| ratio | global (acc / params)   | per_layer (acc / params) | → kết luận |
+| ----- | ----------------------- | ------------------------ | ---------- |
+| 0.5   | **90.87% / 23.06M**     | 90.55% / 25.32M          | global thắng **cả 2** (+0.32% acc, ít hơn 2.3M params) |
+| 0.7   | 87.80% / **14.27M**     | **87.85%** / 16.19M      | acc ~hòa (per_layer +0.05%) nhưng global ít hơn ~2M params (−12%) |
+| 0.9   | **63.00% / 5.97M**      | 60.64% / 6.20M           | global thắng **cả 2** (+2.36% acc, ít params hơn) |
+
+→ **global ≥ per_layer ở mọi mức**: cùng accuracy nhưng ít params hơn (pool toàn cục tự phân bổ cắt
+nhiều ở block "rẻ"). Khoảng cách rõ nhất ở ratio cao (0.9: +2.36%). **Khuyến nghị dùng global.**
+
+**Observations / Pareto pruning:**
+- **Sweet spot = 0.5–0.7.** P1 (global 0.5) gần như free (−0.01% @ −52.9%). P3 (global 0.7) đổi
+  −3.08% acc lấy −70.8% params — vẫn rất tốt cho thesis.
+- **0.9 sụp đổ.** Post-prune ~1% (≈ random 100-class), 20 ep KHÔNG recover hết (val vẫn đang tăng ở
+  ep20: P5 63.0%, P6 60.6%). Cắt 6 head/3.6k MLP còn lại quá ít capacity. Nếu cần ép 0.9 thì phải
+  nhiều epoch hơn — nhưng cost (−28~30%) quá đắt, không đáng.
+- **Pareto frontier (fair):** P1 (90.87%/23M) → P3 (87.80%/14.3M) → P5 (63%/6M). Cả 3 đều là **global**;
+  per_layer P2/P6 bị global dominate, P4 ngang P3 nhưng nhiều params hơn.
+- Post-prune (trước finetune) tụt mạnh hơn khi ratio cao & per_layer (P2 7.01% < P1 19.08%) nhưng
+  finetune san bằng phần lớn ở ratio ≤0.7.
+
+**TODO pruning:**
+- ratio trung gian 0.6 (global) để fill khoảng 23M↔14M.
+- 0.9 với nhiều epoch hơn (30–40) xem có recover không (giá trị học thuật, chứng minh capacity floor).
+- Baseline so sánh: random / magnitude pruning (chứng minh giá trị FIMA-Q importance).
+- Đo FLOPs / latency thực, không chỉ param count.
+- ⚠️ Tất cả single seed (3407) — xác nhận thêm 1–2 seed trước khi chốt luận văn.
+
+---
+
+# APB QAT (Swin-S / Tiny ImageNet → CIFAR-100)
+
 ## Pareto so sánh các run
 
 | # | Date       | br    | scope | DPLR λ | eff_bits | Post-APB | **Best top-1** | Note |
@@ -37,6 +93,33 @@ fim_batches=10, lr=1e-4, bs=64, AMP, seed=3407. Epochs: C1–C4 = 20ep (head-ran
 
 † `best.pth` của C1/C2/C4 **suy ra** từ `packed × comp` (logs cũ không in trực tiếp). C3/C5/C6/C7/C8 là số in thật.
 `best.pth` = checkpoint FP32 (gồm latent_weight APB + α + buffer, ~243 MB) — **mẫu số chuẩn của compression** (theo logs). Compression = best.pth ÷ packed.
+
+### APB **W + A** quant (thêm activation quant — LSQ, từ 2026-06-03)
+
+Từ đây APB không còn weight-only: thêm `--act-bits` (LSQ signed, scope A = input của 96/100 APB Linear).
+Activation là runtime → **không đổi eff-bit/packed** (vẫn tính trên weight); cột "A bit" là phần mới.
+
+| #  | base | scope | br | DPLR λ | **A bit** | batch | ep | eff-bit (W) | **Best top-1** | packed | comp. |
+| -- | ---- | ----- | -- | ------ | --------- | ----- | -- | ----------- | -------------- | ------ | ----- |
+| C8     | (weight-only) | full | 0.99 | 3000 | — (FP32) | 64 | 30 | 1.77 | 88.55% | 10.8 MB | 22.7× |
+| **C8+A8** | C8 | full | 0.99 | 3000 | **8** | 32 | 30 | 1.78 | **88.94%** | 10.8 MB | 22.5× |
+| **C8+A2** | C8 | full | 0.99 | 3000 | **2** | 32 | 29 | 1.78 | **78.49%** | 10.8 MB | 22.5× |
+
+**Đường act-bit ↔ accuracy (full, br0.99, DPLR, batch32):**
+- **A8 = 88.94% → A2 = 78.49% = −10.45%.** A8 vs A2 cùng batch 32 → **ablation SẠCH** (chỉ khác act-bit).
+  2-bit activation trên Swin **rất khắc nghiệt** (đúng dự đoán; activation ViT nhiều outlier). C8+A2 val
+  **chưa plateau ở ep29** (78.11→78.49) → thêm epoch có thể gỡ thêm chút.
+- **A8 ≈ free**: 88.94% còn nhỉnh hơn C8 weight-only 88.55%. ⚠️ **Confound batch:** C8 dùng batch 64,
+  các A-run dùng batch 32 (OOM ở 64) → đừng quy +0.39% cho act-quant; chỉ kết luận "act 8-bit không tụt".
+- Activation là runtime → eff-bit/packed/comp **không đổi** giữa A8/A2/weight-only (10.8 MB, 22.5×). Giá trị
+  của act-quant nằm ở **tốc độ/năng lượng inference + chuẩn W/A**, KHÔNG ở dung lượng file.
+
+Run ~11.7–12h mỗi cái (~1450s/ep). Files: `2026-06-03_..._C8+A8_..._act8.md`, `2026-06-04_..._C8+A2_..._act2.md`.
+TODO: A4 (lấp khoảng A8↔A2); chạy lại C8 batch32 (tách confound batch); C8+A2 nhiều epoch hơn; lặp cho scope skip (C6+A*).
+
+📌 **Đối chiếu paper APB (arXiv 2306.08960):** APB gốc weight-only, khi đo efficiency mới gắn activation
+quant **2-bit** bằng quantizer riêng (EWGS). → Ta dùng LSQ (cùng họ learned-step) là đúng hướng paper;
+2-bit cũng đúng mức paper dùng. Khác biệt = paper làm CNN, ta làm Swin (transformer) → phần novel.
 
 (eff bit = whole-model thật = file×8 ÷ 48.91M params; số Eq10 paper-compare ở bảng "Effective bit" bên dưới.)
 
