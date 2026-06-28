@@ -178,6 +178,70 @@ class LSQActQuant(nn.Module):
         return _round_ste(torch.clamp(x / s, self.Qn, self.Qp)) * s
 
 
+# ============================================================
+# BINARY ACTIVATION QUANT — 1-bit (XNOR/Bi-Real style)
+# ============================================================
+class _BinaryActSTE(torch.autograd.Function):
+    """1-bit activation: out = scale · sign(x), levels {−scale, +scale}.
+
+    Same scale·sign(·) form as APB weight binarization (_APBSTE), but for
+    activations — no mask (binarize all), no stored latent (x is an input).
+
+    Backward:
+        ∂out/∂x     ≈ 1_{|x/scale| < 1}      ← Bi-Real/hardtanh STE (clip outside)
+        ∂out/∂scale = sign(x)                 ← summed over all elements
+    """
+    @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
+    def forward(ctx, x, scale):
+        ctx.save_for_backward(x, scale)
+        return scale * torch.sign(x)
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
+    def backward(ctx, grad_out):
+        x, scale = ctx.saved_tensors
+        # STE for x: pass gradient only where |x/scale| < 1 (clipped identity).
+        grad_x = grad_out * (x.abs() < scale).to(grad_out.dtype)
+        # scale gets ∂out/∂scale = sign(x), accumulated to its scalar shape.
+        grad_scale = (grad_out * torch.sign(x)).sum().reshape(scale.shape)
+        return grad_x, grad_scale
+
+
+class BinaryActQuant(nn.Module):
+    """1-bit activation quantizer: x_q = scale · sign(x), output ∈ {−scale, +scale}.
+
+    Symmetric around 0 (unlike LSQActQuant, which at 1-bit degenerates to Qp=0 and
+    kills the positive half). Learnable per-tensor `scale`, lazily initialised from
+    the first batch to mean|x| (the L1-optimal binary magnitude, XNOR-Net Eq 6).
+    Kept positive via abs() in forward, like APB's α. STE: Bi-Real clipped identity.
+    """
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(1))
+        self.register_buffer('initialized', torch.zeros(1, dtype=torch.uint8))
+
+    @torch.no_grad()
+    def _init_scale(self, x):
+        self.scale.copy_(x.detach().float().abs().mean().clamp_min(1e-8))
+        self.initialized.fill_(1)
+
+    def forward(self, x):
+        if self.initialized.item() == 0:
+            self._init_scale(x)
+        return _BinaryActSTE.apply(x, self.scale.abs())
+
+
+def make_act_quant(act_bits: int):
+    """Activation fake-quant factory: 0/≥32 → None (off), 1 → BinaryActQuant,
+    2..31 → LSQActQuant. Centralises the 1-bit-is-special routing."""
+    if not act_bits or act_bits >= 32:
+        return None
+    if act_bits == 1:
+        return BinaryActQuant()
+    return LSQActQuant(act_bits)
+
+
 class APBLinear(nn.Module):
     """nn.Linear wrapper with APB partition.
 
@@ -196,8 +260,9 @@ class APBLinear(nn.Module):
         self.alpha = nn.Parameter(self.latent_weight.detach().abs().mean())
         # Mask: True = binary. Frozen throughout training.
         self.register_buffer('mask', mask.bool())
-        # Optional LSQ activation fake-quant on this layer's INPUT (0/32 = off).
-        self.act_quant = LSQActQuant(act_bits) if (act_bits and act_bits < 32) else None
+        # Optional activation fake-quant on this layer's INPUT (0/32 = off).
+        # act_bits==1 → BinaryActQuant (sign·scale); 2..31 → LSQActQuant.
+        self.act_quant = make_act_quant(act_bits)
 
     def forward(self, x):
         if self.act_quant is not None:
@@ -716,10 +781,11 @@ def main():
                         '"skip" = 96 Linears (default; safe, skips head + 3 downsample + patch_embed). '
                         '"full" = 100 Linears (aggressive; includes head.fc + downsample.reduction).')
     p.add_argument('--act-bits', type=int, default=0,
-                   help='Activation quant bit-width (LSQ, signed symmetric, learnable step) on the '
-                        'INPUT activations of each APB Linear. 0 or 32 = OFF (weight-only APB, '
-                        'default, backward-compatible). Verify at 8 first, then sweep 4/2. '
-                        '1-bit is degenerate (Qp=0) and not recommended.')
+                   help='Activation quant bit-width on the INPUT activations of each APB '
+                        'Linear. 0 or 32 = OFF (weight-only APB, default, backward-compatible). '
+                        '2..31 = LSQ (signed symmetric, learnable step); verify at 8 first, then '
+                        'sweep 4/2. 1 = BinaryActQuant (sign·scale, XNOR/Bi-Real STE) — true 1-bit '
+                        'activation; expect a large drop on ViT (two-sided, outlier-heavy acts).')
     p.add_argument('--epochs', type=int, default=10)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--batch-size', type=int, default=64)
@@ -869,9 +935,11 @@ def main():
                       act_bits=args.act_bits)
     nl, rb, bits = avg_apb_stats(model)
     print(f'APB: {nl} layers wrapped | avg binary={rb:.3f} | avg eff_bits={bits:.2f}')
-    n_actq = sum(1 for m in model.modules() if isinstance(m, LSQActQuant))
+    n_actq = sum(1 for m in model.modules()
+                 if isinstance(m, (LSQActQuant, BinaryActQuant)))
     if n_actq:
-        print(f'Activation quant: LSQ {args.act_bits}-bit (signed) on {n_actq} '
+        kind = 'Binary (sign·scale)' if args.act_bits == 1 else 'LSQ (signed)'
+        print(f'Activation quant: {kind} {args.act_bits}-bit on {n_actq} '
               f'APB-Linear inputs')
 
     # Eval right after APB (before training)
@@ -897,7 +965,8 @@ def main():
     # Excluding α prevents WD from pulling it toward 0 (which would kill binary magnitude).
     # No weight-decay on α (binary magnitude) nor on the LSQ activation step.
     def _is_nowd(n):
-        return 'alpha' in n or 'act_quant.step' in n
+        return ('alpha' in n or 'act_quant.step' in n
+                or 'act_quant.scale' in n)
     nowd_params  = [p for n, p in model.named_parameters() if _is_nowd(n)]
     other_params = [p for n, p in model.named_parameters() if not _is_nowd(n)]
     opt = optim.AdamW([

@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from qat import LSQActQuant, APBLinear   # noqa: E402
+from qat import LSQActQuant, BinaryActQuant, APBLinear, make_act_quant   # noqa: E402
 
 
 def test_forward_levels():
@@ -109,6 +109,60 @@ def test_backward_compat():
     print('[6] act_bits=0/32 → weight-only, identical to old path OK')
 
 
+def test_binary_forward_levels():
+    q = BinaryActQuant()
+    x = torch.randn(2000) * 3.0
+    y = q(x)                          # triggers lazy init
+    s = q.scale.item()
+    # init = mean|x|
+    assert abs(s - x.abs().mean().item()) < 1e-5, (s, x.abs().mean().item())
+    # output has exactly two levels: {−s, +s} (sign(0)=0 → allow 0 only if x has 0s)
+    uniq = set(round(v, 5) for v in y.unique().tolist())
+    assert uniq.issubset({round(-s, 5), 0.0, round(s, 5)}), uniq
+    assert y[x > 0].eq(s).all() and y[x < 0].eq(-s).all()
+    print(f'[7] binary forward: 2 levels ±s OK (s={s:.4f}=mean|x|)')
+
+
+def test_binary_gradients():
+    q = BinaryActQuant()
+    x = torch.tensor([-5.0, -0.3, 0.2, 5.0], requires_grad=True)
+    _ = q(x.detach())                 # init scale on similar data
+    s = q.scale.detach().abs().clone()
+    q.zero_grad()
+    y = q(x)
+    y.sum().backward()
+    # x grad: STE clipped at |x| < scale
+    expected_x = (x.detach().abs() < s).float()
+    assert torch.allclose(x.grad, expected_x), (x.grad, expected_x)
+    # scale grad: sum(grad_out · sign(x)); grad_out = 1 → sum(sign(x))
+    exp_scale = torch.sign(x.detach()).sum().item()
+    assert abs(q.scale.grad.item() - exp_scale) < 1e-5, (q.scale.grad, exp_scale)
+    print('[8] binary x-grad (clipped STE) + scale-grad (Σ sign) OK')
+
+
+def test_apblinear_act1_is_binary():
+    lin = nn.Linear(16, 8)
+    mask = torch.rand(8, 16) < 0.75
+    layer = APBLinear(lin, mask, act_bits=1)
+    assert isinstance(layer.act_quant, BinaryActQuant), type(layer.act_quant)
+    x = torch.randn(5, 16, requires_grad=True)
+    y = layer(x)
+    assert y.shape == (5, 8)
+    y.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert layer.act_quant.scale.grad is not None
+    assert layer.latent_weight.grad is not None
+    print('[9] APBLinear(act_bits=1) uses BinaryActQuant + all grads finite OK')
+
+
+def test_factory_routing():
+    assert make_act_quant(0) is None and make_act_quant(32) is None
+    assert isinstance(make_act_quant(1), BinaryActQuant)
+    assert isinstance(make_act_quant(2), LSQActQuant)
+    assert isinstance(make_act_quant(8), LSQActQuant)
+    print('[10] make_act_quant routing (0/32→None, 1→Binary, ≥2→LSQ) OK')
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     test_forward_levels()
@@ -116,4 +170,8 @@ if __name__ == '__main__':
     test_x_gradient_ste()
     test_apblinear_act8()
     test_backward_compat()
+    test_binary_forward_levels()
+    test_binary_gradients()
+    test_apblinear_act1_is_binary()
+    test_factory_routing()
     print('\nALL ACT-QUANT TESTS PASSED ✓')
