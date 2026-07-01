@@ -68,3 +68,6 @@ runs_test/
 # Stray images
 *.jpg
 *.jpeg
+
+# Unrelated binaries (e.g. Minecraft OptiFine mod) — keep research repo clean
+*.jar

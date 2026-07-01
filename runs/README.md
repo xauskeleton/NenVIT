@@ -102,20 +102,144 @@ Activation là runtime → **không đổi eff-bit/packed** (vẫn tính trên w
 | #  | base | scope | br | DPLR λ | **A bit** | batch | ep | eff-bit (W) | **Best top-1** | packed | comp. |
 | -- | ---- | ----- | -- | ------ | --------- | ----- | -- | ----------- | -------------- | ------ | ----- |
 | C8     | (weight-only) | full | 0.99 | 3000 | — (FP32) | 64 | 30 | 1.77 | 88.55% | 10.8 MB | 22.7× |
-| **C8+A8** | C8 | full | 0.99 | 3000 | **8** | 32 | 30 | 1.78 | **88.94%** | 10.8 MB | 22.5× |
-| **C8+A2** | C8 | full | 0.99 | 3000 | **2** | 32 | 29 | 1.78 | **78.49%** | 10.8 MB | 22.5× |
+| **C8+A8** | C8 | full | 0.99 | 3000 | **8** (LSQ) | 32 | 30 | 1.78 | **88.94%** | 10.8 MB | 22.5× |
+| **C8+A2** | C8 | full | 0.99 | 3000 | **2** (LSQ) | 32 | 29 | 1.78 | **78.49%** | 10.8 MB | 22.5× |
+| **C8+A1** | C8 | full | 0.99 | 3000 | **1** (Binary) | 32 | 29 | 1.78 | **51.03%** | 10.8 MB | 22.5× |
 
-**Đường act-bit ↔ accuracy (full, br0.99, DPLR, batch32):**
-- **A8 = 88.94% → A2 = 78.49% = −10.45%.** A8 vs A2 cùng batch 32 → **ablation SẠCH** (chỉ khác act-bit).
-  2-bit activation trên Swin **rất khắc nghiệt** (đúng dự đoán; activation ViT nhiều outlier). C8+A2 val
-  **chưa plateau ở ep29** (78.11→78.49) → thêm epoch có thể gỡ thêm chút.
+**Đường act-bit ↔ accuracy (full, br0.99, DPLR, batch32 — ablation SẠCH, chỉ khác act-bit):**
+- **A8 88.94% → A2 78.49% (−10.45%) → A1 51.03% (−27.46% nữa).** Vách đá ở 1-bit: bước A2→A1 dốc gấp
+  ~2.6× bước A8→A2. Hạ bit activation trên Swin **rất khắc nghiệt** (activation ViT 2 phía, nhiều outlier),
+  và 1-bit (chỉ giữ dấu, bỏ magnitude) là cú sốc mạnh nhất. A1=51% vẫn >> random (1%).
+- **1-bit dùng `BinaryActQuant` (sign·scale), KHÔNG phải LSQ** (LSQ degenerate ở 1-bit: Qp=0). Routing tự
+  động qua `make_act_quant`. Commit `8f9b718`.
+- **Plateau:** A1 đã bão hòa ~ep23-29 (50→51), khác A2 (chưa plateau ở ep29). 1-bit chạy thêm epoch lợi rất ít.
 - **A8 ≈ free**: 88.94% còn nhỉnh hơn C8 weight-only 88.55%. ⚠️ **Confound batch:** C8 dùng batch 64,
   các A-run dùng batch 32 (OOM ở 64) → đừng quy +0.39% cho act-quant; chỉ kết luận "act 8-bit không tụt".
-- Activation là runtime → eff-bit/packed/comp **không đổi** giữa A8/A2/weight-only (10.8 MB, 22.5×). Giá trị
+- Activation là runtime → eff-bit/packed/comp **không đổi** giữa A8/A2/A1/weight-only (10.8 MB, 22.5×). Giá trị
   của act-quant nằm ở **tốc độ/năng lượng inference + chuẩn W/A**, KHÔNG ở dung lượng file.
 
-Run ~11.7–12h mỗi cái (~1450s/ep). Files: `2026-06-03_..._C8+A8_..._act8.md`, `2026-06-04_..._C8+A2_..._act2.md`.
-TODO: A4 (lấp khoảng A8↔A2); chạy lại C8 batch32 (tách confound batch); C8+A2 nhiều epoch hơn; lặp cho scope skip (C6+A*).
+**⚠️ Tốc độ (ngược trực giác): 1-bit NHANH hơn 2-bit.** A1 Binary ~1154s/ep (~9.3h) < A2/A8 LSQ ~1450s/ep
+(~11.7h) — nhanh ~20%. LSQ forward nhiều op/kernel hơn (div+clamp+round+mul+grad_scale), Binary chỉ 1 custom
+Function. A1 tốc độ ổn định tuyệt đối (1152-1158s) → không memory thrashing.
+
+Files: `2026-06-03_..._C8+A8_..._act8.md`, `2026-06-04_..._C8+A2_..._act2.md`, `2026-06-28_..._C8+A1_..._act1.md`.
+TODO: A4 (lấp khoảng A8↔A2); chạy lại C8 batch32 (tách confound batch); sửa nhãn log `λ·dplr` (in dplr thô,
+3 số không cộng khớp); 1-bit thử scope skip xem cứu được không; lặp cho scope skip (C6+A*).
+
+### ⭐ Ablation PARTITION: FIMA-Q vs magnitude (flag `--partition`, từ 2026-06-28)
+
+Tiêu chí chọn 1% weight giữ FP-outlier: `fim` (FIMA-Q, mặc định) | `magnitude` (APB gốc, giữ |w| lớn).
+
+#### ⭐⭐⭐⭐⭐ BẢNG TỔNG HỢP — partition (magnitude vs fim) × DPLR loss × act-bit (8 ô, ĐẦY ĐỦ)
+
+Chung: **full / br0.99 / 29ep / batch32 / seed3407**, init-baseline 90.88%. Mỗi ô là 1 run riêng (best top-1).
+
+| act | partition | **no-DPLR** | **+DPLR (λ=3000)** | **DPLR giúp** | file (no-DPLR / DPLR) |
+|:---:|:---------:|:-----------:|:------------------:|:-------------:|------------------------|
+| **1** | fim       | 45.10% | 51.03% | **+5.93%** | `..._act1_fim_nodplr.md` / `..._act1.md` (C8+A1) |
+| **1** | magnitude | 48.87% | **58.29%** | **+9.42%** | `..._act1_magnitude_nodplr.md` / `..._act1_magnitude.md` |
+| **2** | fim       | 65.49% | 78.49% | **+13.00%** | `..._act2_fim_nodplr.md` / `2026-06-04_..._act2.md` (C8+A2) |
+| **2** | magnitude | 77.98% | **81.79%** | **+3.81%** | `..._act2_magnitude_nodplr.md` / `2026-06-30_..._act2_magnitude.md` |
+
+**Gap `magnitude − fim` (cùng act, cùng DPLR):**
+
+| act | no-DPLR | +DPLR |
+|:---:|:-------:|:-----:|
+| **1** | +3.77% | +7.26% |
+| **2** | +12.49% | +3.30% |
+
+**3 kết luận từ bảng tổng hợp (8/8 ô):**
+1. **magnitude > fim ở CẢ 8 ô** (mọi act-bit × mọi DPLR) → finding cực robust. FIM-cho-**partition** thua nhất quán.
+2. **DPLR loss luôn dương** (+3.81 → +13.00 ở cả 4 cặp) → FIM-cho-**distillation** luôn giúp. ⇒ **giá trị FIMA-Q
+   nằm ở distillation loss, KHÔNG ở partition.** Tốt nhất mỗi act = **magnitude+DPLR** (act1 58.29, act2 81.79).
+3. **DPLR×partition đảo chiều theo act-bit:** act1 DPLR ưu ái magnitude (gap nới 3.77→7.26); act2 DPLR ưu ái fim
+   (gap co 12.49→3.30, distillation bù cho fim-partition tệ + magnitude chạm trần).
+
+⚠️ Tất cả single-seed (3407), br0.99/full/CIFAR-100. TODO: br0.95 (gap co?) + seed khác trước khi chốt thesis.
+
+#### ⭐⭐⭐ br0.95 + act2 (init-baseline, full, 29ep, batch32, seed3407) — TRẢ LỜI TODO "gap co ở br0.95?"
+
+3/4 ô của 2×2 (thiếu **magnitude+DPLR**). Init-baseline 90.88% → cũng lấp luôn "br0.95 full fair" còn thiếu.
+Files: `..._br0.95_act2_fim_nodplr.md`, `..._br0.95_act2_magnitude_nodplr.md`, `..._br0.95_act2_fim_dplr.md`.
+
+| partition \ DPLR | **no-DPLR** | **DPLR** | → DPLR giúp |
+|------------------|-------------|----------|-------------|
+| **fim** | 69.75% | 80.53% | **+10.78%** |
+| **magnitude** | **82.63%** | _(chưa chạy)_ | — |
+| **→ magnitude − fim** | **+12.88%** | — | |
+
+**Kết luận br0.95/act2 (3 ô):**
+1. **Gap magnitude−fim (no-DPLR) KHÔNG co lại:** +12.88% ở br0.95 vs +12.49% ở br0.99 → gần như đứng yên
+   (nhích rộng chút). **BÁC BỎ** giả thuyết "fim lật lại / gap co khi bớt cực hạn br0.99→0.95". magnitude
+   thắng fim **9/9 ô** đã đo (8 ô br0.99 + ô br0.95 no-DPLR).
+2. **magnitude/no-DPLR (82.63) > fim/DPLR (80.53) = +2.10%:** magnitude **không** distillation vẫn hơn fim
+   **có** distillation → củng cố mạnh "**giá trị FIMA-Q ở distillation-loss, KHÔNG ở partition**".
+3. **DPLR vẫn giúp fim mạnh** (+10.78%, br0.99 là +13.00%) — distillation vá partition-fim tệ nhưng không đủ đuổi magnitude.
+4. **br giảm 0.99→0.95 nâng đều mọi ô** (fair, cùng init-baseline): fim/no-DPLR +4.26 (65.49→69.75),
+   magnitude/no-DPLR +4.65 (77.98→82.63), fim/DPLR +2.04 (78.49→80.53). Giữ nhiều FP hơn → acc cao hơn,
+   nhưng **thứ hạng partition không đổi**.
+5. eff-bit whole 4.29 / packed 26.2 MB / **9.3×** (br0.95 nén ít hơn br0.99 22.5× — đánh đổi acc↔size rõ).
+
+**TODO còn lại:** (1) ô **magnitude+DPLR** br0.95/act2 để khép 2×2 (dự đoán ~83-84%, ceiling); (2) seed khác.
+
+---
+
+Ma trận 2×2 (partition × DPLR) ở **act-1 / full / br0.99 / 29ep / batch32 / seed3407**:
+
+| partition \ DPLR | **no-DPLR** | **DPLR** | → DPLR giúp |
+|------------------|-------------|----------|-------------|
+| **fim** | **45.10%** | 51.03% | +5.93% |
+| **magnitude** | **48.87%** | **58.29%** | +9.42% |
+| **→ magnitude − fim** | **+3.77%** | **+7.26%** | |
+
+Files: `..._act1.md` (fim+dplr), `..._act1_magnitude.md` (mag+dplr), `..._act1_magnitude_nodplr.md`, `..._act1_fim_nodplr.md`.
+
+**Kết luận (2×2 ĐẦY ĐỦ, ở chế độ cực hạn act1/br0.99/full):**
+1. **⚠️ magnitude > FIM ở CẢ HAI cột** (+3.77% no-DPLR, +7.26% DPLR) → finding **robust**, không nhờ DPLR. ĐI
+   NGƯỢC giả thuyết "FIM partition tốt hơn".
+2. **FIM-cho-partition đơn thuần TỆ HƠN magnitude** (45.10 < 48.87, no-DPLR sạch tuyệt đối): ở binarize cực hạn,
+   FIM chọn outlier *hại* so với giữ |w| lớn.
+3. **Tách vai trò FIM:** kém ở PARTITION nhưng tốt ở DISTILLATION — DPLR (loss dùng FIM) giúp cả hai (+5.93 fim,
+   +9.42 mag). Giả thuyết: APB α·sign(w) sai số lớn nhất ở |w| lớn → giữ |w| lớn FP giảm trực tiếp sai số, lấn
+   át curvature của FIM ở br0.99+act1.
+4. **Tương tác super-additive:** gap magnitude−fim nới rộng khi bật DPLR (3.77 → 7.26); magnitude+DPLR tốt nhất (58.29).
+5. **Tốc độ:** no-DPLR ~928s/ep (7.5h) nhanh ~18% vs DPLR ~1154s/ep (9.1h). magnitude+DPLR verify reproducible (2 lần đều 58.29%).
+
+⚠️ **Đây là config CỰC HẠN NHẤT** — FIM có thể lật lại magnitude ở br0.95/act≥2. TODO: chạy 2×2 (hoặc fim-vs-mag)
+ở **br0.95 + act2** TRƯỚC KHI kết luận; seed khác xác nhận. Nếu FIM thua mọi nơi → định vị lại đóng góp sang FIM-distillation.
+
+**⭐⭐⭐ magnitude > fim ở CẢ act1 LẪN act2 (no-DPLR, cặp SẠCH — chỉ khác partition):**
+| act | fim/no-DPLR | magnitude/no-DPLR | **mag − fim** |
+|-----|-------------|-------------------|---------------|
+| 1 | 45.10% | 48.87% | **+3.77%** |
+| **2** | **65.49%** | **77.98%** | **+12.49%** |
+
+→ **magnitude thắng fim ở mọi act-bit, gap NỚI RỘNG khi act tăng (3.77 → 12.49).** BÁC BỎ giả thuyết "fim lật
+lại khi bớt cực hạn". act1 bị activation 1-bit che lấp partition (gap nhỏ); act2 activation tốt hơn → sai số tái
+tạo weight chi phối → partition lộ rõ → gap lớn. Files `..._act2_magnitude_nodplr.md`, `..._act2_fim_nodplr.md`.
+
+**⭐⭐⭐⭐ 2×2 ĐẦY ĐỦ partition × DPLR ở act2 (full / br0.99 / 29ep / batch32 / seed3407) — ĐÃ KHÉP (2026-06-30):**
+| partition \ DPLR | **no-DPLR** | **DPLR** | → DPLR giúp |
+|------------------|-------------|----------|-------------|
+| **fim** | 65.49% | 78.49% (C8+A2) | **+13.00%** |
+| **magnitude** | 77.98% | **81.79%** | +3.81% |
+| **→ magnitude − fim** | **+12.49%** | **+3.30%** | |
+
+Files: `..._act2_fim_nodplr.md`, C8+A2 (`2026-06-04_..._act2.md`), `..._act2_magnitude_nodplr.md`, `2026-06-30_..._act2_magnitude.md`.
+1. **magnitude > fim ở CẢ 4 ô của act2** (và cả 4 ô act1) → 8/8 cell magnitude thắng. Finding cực robust.
+2. **Tương tác DPLR×partition ĐẢO CHIỀU act1↔act2:** act1 DPLR giúp magnitude nhiều hơn → gap NỚI (3.77→7.26);
+   act2 DPLR giúp **fim** nhiều hơn (+13.00 vs +3.81) → gap **CO** (12.49→3.30). Ở act2, distillation (FIM-loss)
+   bù phần lớn cho partition tệ của fim; magnitude đã tốt nên ít chỗ cải thiện (ceiling). → **FIM giá trị ở
+   DISTILLATION, không ở PARTITION** càng được củng cố: chính DPLR (dùng FIM) cứu fim, không phải fim-partition.
+3. **magnitude+DPLR tốt nhất ở act2 (81.79%, quant cost −9.09%)** — đúng pattern act1 (mag+DPLR=58.29 cũng nhất).
+   act-bit (mag+DPLR): act1 58.29 → act2 81.79 = **+23.50%** (hẹp hơn no-DPLR +29.11 vì DPLR nâng sàn act1).
+
+**⚠️ HỆ QUẢ cho thesis (đối mặt thẳng):** FIM-cho-PARTITION **không giúp** (thua magnitude nhất quán) — kết quả
+ÂM cho "FIMA-Q-guided partition". Nhưng FIM-cho-DISTILLATION (DPLR) VẪN giúp (+5.93/+9.42 ở act1). → **Định vị
+lại: giá trị FIMA-Q nằm ở distillation loss, KHÔNG ở partition** (ít nhất br0.99/full). ✅ **UPDATE
+(2026-06-30):** đã chạy br0.95/act2 (xem section "br0.95 + act2" phía trên) → gap **KHÔNG co** (+12.88% vs
++12.49%), kết luận giữ nguyên qua cả br. TODO còn: (1) khép ô magnitude+DPLR br0.95; (2) seed khác.
+- (phụ) act2/magnitude/no-DPLR 77.98 ≈ C8+A2 fim+DPLR 78.49 (−0.51%) dù không distill; act-bit mag/no-DPLR: act1 48.87→act2 77.98 (+29.11%).
 
 📌 **Đối chiếu paper APB (arXiv 2306.08960):** APB gốc weight-only, khi đo efficiency mới gắn activation
 quant **2-bit** bằng quantizer riêng (EWGS). → Ta dùng LSQ (cùng họ learned-step) là đúng hướng paper;
