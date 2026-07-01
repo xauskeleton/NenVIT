@@ -24,7 +24,7 @@ CONFIG = {
     'batch_size':         64,      # batch size train/val
     # FIM extraction
     'fim_batches':        5,       # = rank k (paper default)
-    'fim_mode':           'dplr',  # 'dplr' | 'rank' | 'diag'
+    'importance':         'dplr',  # 'dplr' | 'fisher'
     'fim_p1':             1.0,     # weight rank-k (L2)
     'fim_p2':             1.0,     # weight diag (L1)
     # Dynamic mask refresh — DISABLED for stability

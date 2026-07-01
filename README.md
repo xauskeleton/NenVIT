@@ -62,8 +62,10 @@ Backward: custom STE preserves cả `latent_weight` và `α` gradient.
 | `--epochs` | 10 | QAT epochs |
 | `--lr` | 1e-4 | AdamW |
 | `--batch-size` | 64 | |
-| `--fim-batches` | 5 | k samples cho FIM extract |
-| `--fim-mode` | dplr | dplr / rank / diag |
+| `--fim-batches` | 5 | k calib batches cho importance (+ rank k của DPLR loss) |
+| `--importance-full` | False | tính importance trên **toàn dataset** (1 pass, exact; nên dùng với `fisher`) |
+| `--logits-reversal` | False | LR (arXiv 2603.18596): dùng CE(-logit) khi tính importance, fix gradient-vanishing; trực giao với `--importance` (`fisher`+LR = Ω^LR của paper) |
+| `--importance` | dplr | dplr / fisher (`--fim-mode` alias) |
 | `--use-dplr-loss` | False | DPLR distillation loss |
 | `--dplr-lambda` | 1.0 | Dùng **3000** (raw DPLR ~0.002 vs CE ~6) |
 | `--debug` | False | 2-epoch smoke test |

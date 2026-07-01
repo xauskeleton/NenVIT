@@ -333,7 +333,7 @@ def get_target_layers(model: nn.Module, scope: str = 'skip') -> dict:
 # ============================================================
 def compute_weight_dplr_fim(model, calib_loader, device,
                              n_batches=5, p1=1.0, p2=1.0, fim_mode='dplr',
-                             scope='skip'):
+                             scope='skip', full=False, logits_reversal=False):
     """
     Compute DPLR-FIM-based importance for each target Linear's weights.
 
@@ -350,19 +350,37 @@ def compute_weight_dplr_fim(model, calib_loader, device,
       F_DPLR(W_ij) = f_DPLR(i) · E[x_j²]
 
     Args:
-      n_batches: number of (forward + backward) samples
+      n_batches: number of (forward + backward) calibration batches (ignored if full=True)
+      full: if True, ignore n_batches and make ONE pass over the ENTIRE loader —
+        exact importance with no calibration sampling error (esp. for 'fisher').
+      logits_reversal: if True, negate the logits before the CE loss (Logits
+        Reversal, arXiv 2603.18596 "EWC Done Right"). The backward gradient at
+        each logit becomes (y_k - softmax(-z)_k) instead of (softmax(z)_k - y_k),
+        which avoids the gradient-vanishing of standard FIM on confident-correct
+        samples. ORTHOGONAL to fim_mode: it only changes the loss whose gradient
+        `g` feeds the estimator, so it composes with dplr/fisher/rank/diag.
+        fim_mode='fisher' + logits_reversal reproduces the paper's Ω^LR.
       p1: weight for rank-k (L2) component
       p2: weight for diag (L1) component
-      fim_mode: 'dplr' | 'rank' | 'diag' — switch for ablation
+      fim_mode: 'dplr' | 'rank' | 'diag' | 'fisher' — switch for ablation
+        'fisher' = exact empirical Fisher diagonal, per-token, WITHOUT the g⊥x
+        factorization the others use: F(W_ij) = (1/T) Σ_t g_i(t)²·x_j(t)²,
+        computed as matmul (g²)ᵀ(x²) so the per-token g–x correlation is kept
+        (vs 'rank' = factorized E[g²]·E[x²]). Costs one (out,in) accumulator +
+        caching x² between fwd/bwd → more memory.
 
     Returns:
       dict {name: F_DPLR(W) tensor of shape (out, in)}
     """
     targets = get_target_layers(model, scope=scope)
+    fisher = (fim_mode == 'fisher')
     # Accumulators
     x_sq  = {n: 0.0 for n in targets}   # E[x²] per input channel
     g_abs = {n: 0.0 for n in targets}   # E[|g|]  per output channel  (for diag)
     g_sq  = {n: 0.0 for n in targets}   # E[g²]   per output channel  (for rank-k)
+    gx_sq = {n: 0.0 for n in targets}   # exact Fisher: Σ_t g_i(t)²·x_j(t)²  (out,in)
+    tok   = {n: 0 for n in targets}     # token count per layer (fisher mode)
+    x_cache = {}                        # fisher: per-layer x² (T,in) between fwd & bwd
     n_samples = 0
 
     hooks = []
@@ -371,35 +389,54 @@ def compute_weight_dplr_fim(model, calib_loader, device,
             def h(_m, inp, _out):
                 x = inp[0].detach()
                 B = x.shape[0]
-                x_sq[n] = x_sq[n] + (x.float() ** 2).reshape(-1, x.shape[-1]).mean(dim=0) * B
+                xf2 = (x.float() ** 2).reshape(-1, x.shape[-1])   # (T, in)
+                if fisher:
+                    x_cache[n] = xf2                              # keep per-token to pair with g
+                else:
+                    x_sq[n] = x_sq[n] + xf2.mean(dim=0) * B
             return h
         def make_bwd(n):
             def h(_m, _gi, go):
                 g = go[0]
                 if g is None: return
                 B = g.shape[0]
-                gf = g.detach().float()
-                gf_flat = gf.reshape(-1, gf.shape[-1])
-                g_abs[n] = g_abs[n] + gf_flat.abs().mean(dim=0) * B
-                g_sq[n]  = g_sq[n]  + (gf_flat ** 2).mean(dim=0) * B
+                gf_flat = g.detach().float().reshape(-1, g.shape[-1])   # (T, out)
+                if fisher:
+                    xf2 = x_cache.pop(n, None)
+                    if xf2 is None: return
+                    gx_sq[n] = gx_sq[n] + (gf_flat ** 2).transpose(0, 1) @ xf2  # (out,in)
+                    tok[n] = tok[n] + gf_flat.shape[0]
+                else:
+                    g_abs[n] = g_abs[n] + gf_flat.abs().mean(dim=0) * B
+                    g_sq[n]  = g_sq[n]  + (gf_flat ** 2).mean(dim=0) * B
             return h
         hooks.append(mod.register_forward_hook(make_fwd(name)))
         hooks.append(mod.register_full_backward_hook(make_bwd(name)))
 
     model.train()
     crit = nn.CrossEntropyLoss()
-    for i, (x, y) in enumerate(tqdm(calib_loader, total=n_batches, desc='FIM extract', leave=False)):
-        if i >= n_batches: break
+    total = len(calib_loader) if full else n_batches
+    for i, (x, y) in enumerate(tqdm(calib_loader, total=total, desc='FIM extract', leave=False)):
+        if not full and i >= n_batches: break
         model.zero_grad()
         x = x.to(device); y = y.to(device)
-        loss = crit(model(x), y)
+        logits = model(x)
+        if logits_reversal:              # arXiv 2603.18596: CE(-z, y) → grad = y_k - softmax(-z)_k
+            logits = -logits
+        loss = crit(logits, y)
         loss.backward()
         n_samples += x.size(0)
+        x_cache.clear()          # drop any un-consumed cached activations (fisher)
     for h in hooks: h.remove()
     model.zero_grad()
 
     fim = {}
     for name in targets:
+        if fim_mode == 'fisher':
+            if isinstance(gx_sq[name], float):       # layer never saw a gradient
+                continue
+            fim[name] = (gx_sq[name] / max(tok[name], 1)).cpu()  # (out,in) exact Fisher
+            continue
         if isinstance(g_abs[name], float):
             continue
         gd = g_abs[name] / n_samples            # f_diag (L1)
@@ -409,7 +446,7 @@ def compute_weight_dplr_fim(model, calib_loader, device,
         if   fim_mode == 'diag': f_i = gd
         elif fim_mode == 'rank': f_i = gr
         elif fim_mode == 'dplr': f_i = p1 * gr + p2 * gd
-        else: raise ValueError(f'fim_mode must be dplr|rank|diag, got {fim_mode}')
+        else: raise ValueError(f'fim_mode must be dplr|rank|diag|fisher, got {fim_mode}')
 
         fim[name] = (f_i.unsqueeze(1) * xs.unsqueeze(0)).cpu()  # (out, in)
     return fim
@@ -422,16 +459,36 @@ compute_weight_fim = compute_weight_dplr_fim
 # ============================================================
 # APPLY APB (replace nn.Linear → APBLinear)
 # ============================================================
-def apply_apb(model, fim_dict, binary_ratio, device, scope='skip', act_bits=0):
-    """Wrap each target Linear with APBLinear using FIM-percentile mask.
+def _partition_score(weight, fim, partition):
+    """Per-weight importance for the APB partition. Convention: LOW score → binarize,
+    HIGH score (top `1-binary_ratio`) → kept full-precision outlier.
+
+      'fim'       → FIMA-Q importance (our method; needs precomputed `fim`)
+      'magnitude' → |w| (pure APB: keep the largest-magnitude weights FP)
+
+    Returns a CPU float tensor shaped like the weight (out, in)."""
+    if partition == 'fim':
+        if fim is None:
+            raise ValueError("partition='fim' needs a FIM dict for this layer")
+        return fim.float()
+    if partition == 'magnitude':
+        return weight.detach().abs().float().cpu()
+    raise ValueError(f'partition must be fim|magnitude, got {partition!r}')
+
+
+def apply_apb(model, fim_dict, binary_ratio, device, scope='skip', act_bits=0,
+              partition='fim'):
+    """Wrap each target Linear with APBLinear using a `partition`-percentile mask.
+    partition: 'fim' (FIMA-Q, default) or 'magnitude' (pure APB).
     act_bits: LSQ activation bit-width on each wrapped layer's input (0/32 = off)."""
     targets = get_target_layers(model, scope=scope)
     for name, mod in targets.items():
         if isinstance(mod, APBLinear):
             continue  # already wrapped
-        fim = fim_dict[name]
-        tau = torch.quantile(fim.flatten().float(), binary_ratio)
-        mask = (fim < tau)
+        fim = fim_dict.get(name) if fim_dict else None
+        score = _partition_score(mod.weight, fim, partition)
+        tau = torch.quantile(score.flatten().float(), binary_ratio)
+        mask = (score < tau)
         new_layer = APBLinear(mod, mask=mask, act_bits=act_bits).to(device)
         # Reassign in parent
         parent = model
@@ -442,8 +499,8 @@ def apply_apb(model, fim_dict, binary_ratio, device, scope='skip', act_bits=0):
     return model
 
 
-def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip'):
-    """Refresh masks of APBLinear layers in-place using new FIM values.
+def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip', partition='fim'):
+    """Refresh masks of APBLinear layers in-place using the chosen `partition` score.
     Keeps latent_weight, α, and structure intact — only mask buffer changes."""
     n_updated = 0
     n_flipped_total = 0
@@ -451,11 +508,12 @@ def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip'):
     for name, mod in get_target_layers(model, scope=scope).items():
         if not isinstance(mod, APBLinear):
             continue
-        if name not in fim_dict:
+        if partition == 'fim' and name not in fim_dict:
             continue
-        fim = fim_dict[name].to(mod.mask.device)
-        tau = torch.quantile(fim.flatten().float(), binary_ratio)
-        new_mask = (fim < tau)
+        fim = fim_dict.get(name) if fim_dict else None
+        score = _partition_score(mod.latent_weight, fim, partition).to(mod.mask.device)
+        tau = torch.quantile(score.flatten().float(), binary_ratio)
+        new_mask = (score < tau)
         # Count how many positions changed
         flipped = (new_mask != mod.mask).sum().item()
         mod.mask.data.copy_(new_mask)
@@ -780,6 +838,11 @@ def main():
                    help='Layer scope for APB. '
                         '"skip" = 96 Linears (default; safe, skips head + 3 downsample + patch_embed). '
                         '"full" = 100 Linears (aggressive; includes head.fc + downsample.reduction).')
+    p.add_argument('--partition', choices=['fim', 'magnitude'], default='fim',
+                   help='Criterion for the APB binary/FP partition (which weights stay FP outliers). '
+                        '"fim" = FIMA-Q importance (default, our method). '
+                        '"magnitude" = keep largest-|w| FP (PURE APB baseline). '
+                        'magnitude skips FIM extraction unless --use-dplr-loss needs it.')
     p.add_argument('--act-bits', type=int, default=0,
                    help='Activation quant bit-width on the INPUT activations of each APB '
                         'Linear. 0 or 32 = OFF (weight-only APB, default, backward-compatible). '
@@ -790,11 +853,30 @@ def main():
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--fim-batches', type=int, default=5,
-                   help='Number of batches (= rank k) for FIM extraction (default 5)')
-    p.add_argument('--fim-mode', type=str, default='dplr',
-                   choices=['dplr', 'rank', 'diag'],
-                   help='FIM approximation: dplr (paper default, p1·rank-k + p2·diag), '
-                        'rank (only L2 sample variance), diag (only L1, faster)')
+                   help='Number of calib batches (= rank k) for FIM extraction (default 5). '
+                        'Also serves as rank k for the DPLR distillation loss.')
+    p.add_argument('--importance-full', action='store_true',
+                   help='Compute the APB-partition importance over the ENTIRE dataset '
+                        '(one full pass) instead of --fim-batches calibration batches. '
+                        'For exact importance with no sampling error (recommended with '
+                        "--importance fisher). Independent of --fim-batches, which still "
+                        'sets rank k for the DPLR loss.')
+    p.add_argument('--logits-reversal', dest='logits_reversal',
+                   action='store_true',
+                   help='Logits Reversal for importance (arXiv 2603.18596, "EWC Done '
+                        'Right"): negate logits before the CE loss when extracting the '
+                        'FIM, so grad = y_k - softmax(-z)_k. Fixes gradient-vanishing on '
+                        'confident-correct samples. ORTHOGONAL to --importance (only '
+                        'changes the loss for importance/partition, NOT the DPLR '
+                        'distillation loss). --importance fisher + --logits-reversal '
+                        "reproduces the paper's Ω^LR.")
+    p.add_argument('--importance', '--fim-mode', dest='importance', type=str,
+                   default='dplr', choices=['dplr', 'fisher'],
+                   help="Importance metric for the APB bit-partition: 'dplr' (default, "
+                        "FIMA-Q-inspired p1*E[g^2]+p2*E[|g|] then *E[x^2]) or 'fisher' "
+                        "(exact empirical Fisher, per-token, no g-x independence "
+                        "factorization). rank/diag still reachable via dplr with "
+                        "--fim-p2 0 / --fim-p1 0. (--fim-mode kept as alias.)")
     p.add_argument('--fim-p1', type=float, default=1.0,
                    help='Weight for rank-k (L2) component in DPLR (default 1.0)')
     p.add_argument('--fim-p2', type=float, default=1.0,
@@ -852,6 +934,7 @@ def main():
 
     if args.debug:
         args.epochs = 2; args.fim_batches = 1; args.batch_size = 32; args.num_workers = 0
+        args.importance_full = False   # keep debug fast (no full-dataset importance pass)
         # 2 epochs so recompute-fim-every=1 can be tested if user passes it
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -916,23 +999,34 @@ def main():
     t1, t5, n = evaluate(model, val_loader, device, max_batches=max_b)
     print(f'[FP baseline]   top1={t1:.2f}% top5={t5:.2f}% ({n} samples)')
 
-    # ----- FIM extraction (DPLR by default per FIMA-Q paper) -----
-    print(f'Computing {args.fim_mode.upper()}-FIM(W) over {args.fim_batches} samples '
-          f'(p1={args.fim_p1}, p2={args.fim_p2}) ...')
-    t0 = time.time()
-    fim_dict = compute_weight_dplr_fim(model, calib_loader, device,
-                                        n_batches=args.fim_batches,
-                                        p1=args.fim_p1, p2=args.fim_p2,
-                                        fim_mode=args.fim_mode,
-                                        scope=args.apb_scope)
-    print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers '
-          f'(scope={args.apb_scope})')
+    # ----- FIM extraction (needed for partition='fim' OR the DPLR distillation loss) -----
+    need_fim = (args.partition == 'fim') or args.use_dplr_loss
+    fim_dict = {}
+    if need_fim:
+        why = "partition='fim'" if args.partition == 'fim' else 'DPLR loss'
+        over = ('the FULL dataset' if args.importance_full
+                else f'{args.fim_batches} calib batches')
+        lr_tag = ' +LR' if args.logits_reversal else ''
+        print(f'Computing {args.importance.upper()}{lr_tag}-FIM(W) over {over} '
+              f'(p1={args.fim_p1}, p2={args.fim_p2}) [for {why}] ...')
+        t0 = time.time()
+        fim_dict = compute_weight_dplr_fim(model, calib_loader, device,
+                                            n_batches=args.fim_batches,
+                                            p1=args.fim_p1, p2=args.fim_p2,
+                                            fim_mode=args.importance,
+                                            scope=args.apb_scope,
+                                            full=args.importance_full,
+                                            logits_reversal=args.logits_reversal)
+        print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers '
+              f'(scope={args.apb_scope})')
+    else:
+        print(f"Skipping FIM extraction (partition={args.partition!r}, no DPLR loss).")
 
     # ----- Apply APB -----
     print(f'Applying APB (scope={args.apb_scope}, binary_ratio={args.binary_ratio}, '
-          f'act_bits={args.act_bits or "off"}) ...')
+          f'partition={args.partition}, act_bits={args.act_bits or "off"}) ...')
     model = apply_apb(model, fim_dict, args.binary_ratio, device, scope=args.apb_scope,
-                      act_bits=args.act_bits)
+                      act_bits=args.act_bits, partition=args.partition)
     nl, rb, bits = avg_apb_stats(model)
     print(f'APB: {nl} layers wrapped | avg binary={rb:.3f} | avg eff_bits={bits:.2f}')
     n_actq = sum(1 for m in model.modules()
@@ -1002,18 +1096,23 @@ def main():
           f'freeze α at epoch {freeze_at}, dplr={dplr is not None}, amp={use_amp}')
     print(f'='*60)
     for ep in range(start_epoch, args.epochs):
-        # Periodic FIM recompute + mask refresh
+        # Periodic mask refresh (FIM recompute only when partition='fim')
         if (args.recompute_fim_every > 0 and ep > 0
                 and ep % args.recompute_fim_every == 0):
             t_fim = time.time()
-            fim_new = compute_weight_dplr_fim(model, calib_loader, device,
-                                              n_batches=args.fim_batches,
-                                              p1=args.fim_p1, p2=args.fim_p2,
-                                              fim_mode=args.fim_mode,
-                                              scope=args.apb_scope)
+            fim_new = {}
+            if args.partition == 'fim':
+                fim_new = compute_weight_dplr_fim(model, calib_loader, device,
+                                                  n_batches=args.fim_batches,
+                                                  p1=args.fim_p1, p2=args.fim_p2,
+                                                  fim_mode=args.importance,
+                                                  scope=args.apb_scope,
+                                                  full=args.importance_full,
+                                                  logits_reversal=args.logits_reversal)
             n_upd, flip_pct = update_masks_from_fim(model, fim_new, args.binary_ratio,
-                                                     scope=args.apb_scope)
-            print(f'  >> Epoch {ep+1}: refreshed FIM ({n_upd} layers, '
+                                                     scope=args.apb_scope,
+                                                     partition=args.partition)
+            print(f'  >> Epoch {ep+1}: refreshed mask [{args.partition}] ({n_upd} layers, '
                   f'{flip_pct:.1f}% positions flipped) in {time.time()-t_fim:.1f}s')
 
         if ep == freeze_at:

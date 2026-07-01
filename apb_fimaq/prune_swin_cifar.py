@@ -72,8 +72,25 @@ def main():
                    help='Global only: each block keeps >= this fraction of MLP '
                         'neurons (safety floor, avoids 1-neuron blocks). Default 0.05.')
     p.add_argument('--fim-batches', type=int, default=10,
-                   help='Calib batches for DPLR-FIM importance.')
-    p.add_argument('--fim-mode', choices=['dplr', 'rank', 'diag'], default='dplr')
+                   help='Calib batches for the pruning importance (ignored if '
+                        '--importance-full).')
+    p.add_argument('--importance-full', action='store_true',
+                   help='Compute pruning importance over the ENTIRE training set '
+                        '(one full pass) instead of --fim-batches calib batches. '
+                        'Exact importance, no sampling error (recommended with '
+                        '--importance fisher).')
+    p.add_argument('--logits-reversal', dest='logits_reversal',
+                   action='store_true',
+                   help='Logits Reversal (arXiv 2603.18596, "EWC Done Right"): negate '
+                        'logits before the CE loss when computing importance, so '
+                        'grad = y_k - softmax(-z)_k. Fixes gradient-vanishing on '
+                        'confident-correct samples. Orthogonal to --importance; '
+                        "--importance fisher + --logits-reversal = paper's Ω^LR.")
+    p.add_argument('--importance', '--fim-mode', dest='importance',
+                   choices=['dplr', 'fisher'], default='dplr',
+                   help="Pruning importance metric. 'dplr' = FIMA-Q-inspired "
+                        "p1*E[g^2]+p2*E[|g|] then *E[x^2] (default); 'fisher' = exact "
+                        "empirical Fisher (1/T)*sum_t(g*x)^2. (--fim-mode kept as alias.)")
     p.add_argument('--epochs', type=int, default=15)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight-decay', type=float, default=1e-4)
@@ -94,6 +111,7 @@ def main():
         args.batch_size = min(args.batch_size, 16)
         args.num_workers = 0
         args.fim_batches = 2
+        args.importance_full = False   # keep debug fast (no full-dataset importance pass)
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -128,13 +146,17 @@ def main():
     t1, t5, n = evaluate(model, val_loader, device, max_batches=max_b)
     print(f'[FP baseline]   top1={t1:.2f}% top5={t5:.2f}% ({n} samples)')
 
-    # ----- FIMA-Q importance -----
-    print(f'Computing DPLR-FIM importance over {args.fim_batches} batches '
-          f'(mode={args.fim_mode}) ...')
+    # ----- importance (FIMA-Q-inspired 'dplr' or exact 'fisher') -----
+    over = ('the FULL training set' if args.importance_full
+            else f'{args.fim_batches} batches')
+    lr_tag = ' +LR' if args.logits_reversal else ''
+    print(f'Computing importance over {over} '
+          f'(importance={args.importance}{lr_tag}) ...')
     t0 = time.time()
     fim = compute_weight_dplr_fim(model, train_loader, device,
-                                  n_batches=args.fim_batches, fim_mode=args.fim_mode,
-                                  scope='skip')
+                                  n_batches=args.fim_batches, fim_mode=args.importance,
+                                  scope='skip', full=args.importance_full,
+                                  logits_reversal=args.logits_reversal)
     print(f'FIM done in {time.time()-t0:.1f}s, {len(fim)} layers')
 
     # ----- structural prune -----
