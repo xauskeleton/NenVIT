@@ -48,10 +48,37 @@ nhiều ở block "rẻ"). Khoảng cách rõ nhất ở ratio cao (0.9: +2.36%)
 - Post-prune (trước finetune) tụt mạnh hơn khi ratio cao & per_layer (P2 7.01% < P1 19.08%) nhưng
   finetune san bằng phần lớn ở ratio ≤0.7.
 
+## ⭐ Ablation IMPORTANCE cho pruning (dplr / fisher / magnitude) — global, seed 3407
+
+So các importance metric ở CÙNG config global (`--global-metric per_param --mlp-keep-frac 0.05`),
+đổi head/mlp ratio 0.5/0.7/0.9. Mỗi ô = **best top-1 % (params M)** sau finetune. FP baseline 90.88%.
+(fisher+LR+full = `--importance fisher --logits-reversal --importance-full`.)
+
+| importance         | 0.5              | 0.7              | 0.9              |
+| ------------------ | ---------------- | ---------------- | ---------------- |
+| **dplr**           | **90.87** (23.1) | **87.80** (14.3) | 63.00 (6.0)      |
+| **fisher**         | 90.39 (22.1)     | 87.50 (13.6)     | 71.07 (5.7)      |
+| **fisher+LR+full** | 90.40 (23.4)     | 87.47 (14.2)     | **72.26** (5.7)  |
+| magnitude l2sq     | 88.33 (25.8)     | 79.01 (15.8)     | 53.08 (5.9)      |
+| magnitude l1       | 87.60 (26.1)     | 76.71 (16.0)     | 51.31 (5.9)      |
+
+**Kết luận (nguồn: `image.png`):**
+1. **⭐ FIM (dplr/fisher) THẮNG magnitude ở MỌI ratio** — NGƯỢC với ablation partition của QAT (magnitude
+   thắng fim 9/9 ô). ⇒ FIMA-Q importance **có giá trị cho structural pruning** (dù không cho partition).
+   Trả lời TODO "chứng minh giá trị FIMA-Q importance": ✅ đã chứng minh (cho pruning).
+2. **dplr ≈ fisher ở 0.5/0.7** (dplr acc nhỉnh +0.3%, fisher ít params hơn ~1M) → Pareto xấp xỉ ngang.
+3. **⭐ Ở 0.9, fisher vượt trội dplr: 71–72% vs 63% (+8~9%) mà ít params hơn** (5.7 vs 6.0M) → fisher
+   BỀN hơn khi prune cực hạn. `+LR+full` nhích thêm chút (72.26).
+4. **magnitude l2sq > l1** nhất quán; cả hai bị dominate → đúng vai trò baseline.
+
+⚠️ Checkpoint các run trên ĐÃ BỊ ĐÈ (mọi run ghi cùng `--out-dir` mặc định `ckpt/pruned_cifar100`, tên
+file cố định). Bản còn giữ riêng: `ckpt/best_pruned_g05_fisher.pt` (fisher 0.5, 22M) — dùng bản này để
+quantize (prune+quant). Re-run bản khác PHẢI truyền `--out-dir` riêng.
+
 **TODO pruning:**
 - ratio trung gian 0.6 (global) để fill khoảng 23M↔14M.
 - 0.9 với nhiều epoch hơn (30–40) xem có recover không (giá trị học thuật, chứng minh capacity floor).
-- Baseline so sánh: random / magnitude pruning (chứng minh giá trị FIMA-Q importance).
+- ✅ Baseline magnitude pruning ĐÃ CHẠY (bảng importance ở trên) — FIM thắng magnitude mọi ratio. Còn thiếu: random-pruning baseline.
 - Đo FLOPs / latency thực, không chỉ param count.
 - ⚠️ Tất cả single seed (3407) — xác nhận thêm 1–2 seed trước khi chốt luận văn.
 

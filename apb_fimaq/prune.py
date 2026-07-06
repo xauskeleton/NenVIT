@@ -68,6 +68,46 @@ def neuron_importance_from_fim(model, fim_dict):
     return out
 
 
+# ---- magnitude (data-free): mirror the FIM aggregation, replacing FIM(w) with |w|/w^2
+def _mag(w, norm):
+    """Per-weight magnitude score: w**2 (l2sq) or |w| (l1)."""
+    w = w.detach().float()
+    return w * w if norm == 'l2sq' else w.abs()
+
+
+def head_importance_from_magnitude(model, norm='l2sq'):
+    """Per-head importance from weight magnitude only (data-free). Aggregates the
+    SAME slices as head_importance_from_fim, but scores each weight by |w|/w**2
+    instead of FIM. norm='l2sq' → Σw**2 (symmetric with FIM's F·w**2 Taylor term);
+    norm='l1' → Σ|w| (matches APB's |w| magnitude convention)."""
+    out = {}
+    for name, mod in model.named_modules():
+        if not isinstance(mod, _swin.WindowAttention):
+            continue
+        H = mod.num_heads
+        dim = mod.qkv.in_features
+        hd = dim // H
+        per_out = _mag(mod.qkv.weight, norm).sum(dim=1)        # (3*dim,)
+        imp = per_out.view(3, H, hd).sum(dim=(0, 2))           # (H,)
+        per_in = _mag(mod.proj.weight, norm).sum(dim=0)        # (dim,) input channels
+        imp = imp + per_in.view(H, hd).sum(dim=1)
+        out[name] = imp.cpu()
+    return out
+
+
+def neuron_importance_from_magnitude(model, norm='l2sq'):
+    """Per-MLP-neuron importance from weight magnitude only (data-free); mirrors
+    neuron_importance_from_fim with |w|/w**2 scores. See head_importance_from_magnitude."""
+    out = {}
+    for name, mod in model.named_modules():
+        if not isinstance(mod, Mlp):
+            continue
+        imp = _mag(mod.fc1.weight, norm).sum(dim=1)            # per output neuron
+        imp = imp + _mag(mod.fc2.weight, norm).sum(dim=0)      # per input neuron
+        out[name] = imp.cpu()
+    return out
+
+
 # ------------------------------------------------------------------ structural cut
 @torch.no_grad()
 def prune_heads_in_attn(attn, keep):
@@ -188,7 +228,8 @@ def _global_keep(imp_dict, cost_dict, ratio, floor_dict, metric):
 # ------------------------------------------------------------------ driver
 def prune_swin(model, fim_dict, head_ratio=0.25, mlp_ratio=0.25, min_heads=1,
                rank_mode='per_layer', global_metric='per_param',
-               head_keep_frac=0.0, mlp_keep_frac=0.05):
+               head_keep_frac=0.0, mlp_keep_frac=0.05,
+               importance='fim', mag_norm='l2sq'):
     """Prune `head_ratio` of heads and `mlp_ratio` of MLP neurons, dropping the
     lowest-FIMA-Q-importance units. Returns a stats dict.
 
@@ -206,8 +247,12 @@ def prune_swin(model, fim_dict, head_ratio=0.25, mlp_ratio=0.25, min_heads=1,
     A floor only binds when global tries to prune that block beyond it.
     """
     assert rank_mode in ('per_layer', 'global')
-    head_imp = head_importance_from_fim(model, fim_dict)
-    neuron_imp = neuron_importance_from_fim(model, fim_dict)
+    if importance == 'magnitude':
+        head_imp = head_importance_from_magnitude(model, norm=mag_norm)
+        neuron_imp = neuron_importance_from_magnitude(model, norm=mag_norm)
+    else:
+        head_imp = head_importance_from_fim(model, fim_dict)
+        neuron_imp = neuron_importance_from_fim(model, fim_dict)
     attns = {n: m for n, m in model.named_modules()
              if isinstance(m, _swin.WindowAttention)}
     mlps = {n: m for n, m in model.named_modules() if isinstance(m, Mlp)}
@@ -242,7 +287,8 @@ def prune_swin(model, fim_dict, head_ratio=0.25, mlp_ratio=0.25, min_heads=1,
         'param_reduction': 1 - p1 / p0,
         'heads_before': n_heads_before, 'heads_after': n_heads_after,
         'mlp_neurons_before': n_neur_before, 'mlp_neurons_after': n_neur_after,
-        'rank_mode': rank_mode,
+        'rank_mode': rank_mode, 'importance': importance,
+        'mag_norm': mag_norm if importance == 'magnitude' else None,
     }
 
 

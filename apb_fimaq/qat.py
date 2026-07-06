@@ -25,8 +25,15 @@ USAGE
     python qat.py --fim-mode rank              # ablation: rank-k only
     python qat.py --fim-p1 1.5 --fim-p2 0.5    # tune DPLR weights
     python qat.py --debug                      # 1 epoch, k=1, smoke test
+
+    # Quantize a PRUNED model (prune -> finetune -> APB-QAT). --init-model loads the
+    # whole saved model object, so its pruned (heads/MLP) architecture is used as-is:
+    python qat.py --dataset cifar100 \
+        --init-model ckpt/pruned_cifar100/best_pruned_model.pt \
+        --binary-ratio 0.75 --epochs 10
 """
 import argparse
+import copy
 import math
 import sys
 from tqdm.auto import tqdm
@@ -923,6 +930,14 @@ def main():
                    help='Path to last.pth checkpoint to resume from (model+opt+sched+scaler+epoch). '
                         'Use to recover after Kaggle session timeout. Mask is re-derived from '
                         'the saved checkpoint, so --binary-ratio/--apb-scope must match the original run.')
+    p.add_argument('--init-model', type=str, default='',
+                   help='Path to a WHOLE saved model object (torch.save(model), NOT a '
+                        'state_dict) to quantize as-is — e.g. a pruned model from '
+                        'prune_swin_cifar.py (ckpt/pruned_cifar100/best_pruned_model.pt). '
+                        'Its (possibly pruned) architecture is used directly; '
+                        'timm.create_model + init_from_baseline are SKIPPED. The model '
+                        "must already match --dataset's num_classes. This is how you "
+                        'quantize a pruned model (prune -> finetune -> APB-QAT).')
     p.add_argument('--export-packed', action=argparse.BooleanOptionalAction, default=True,
                    help='After training, also save best_packed.pt in paper format (Eq 10): '
                         '(n-s) binary signs + (fp_position, fp_value) pairs + α per layer. '
@@ -940,6 +955,14 @@ def main():
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed); np.random.seed(args.seed); torch.cuda.manual_seed_all(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Windows consoles default to cp1252, which can't encode the 'α' (α) in our
+    # log lines — force UTF-8 so real runs don't crash mid-training on a print().
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
 
     # ----- Log file (tee stdout) -----
     log_path = args.log_file or str(out_dir / 'train.log')
@@ -984,14 +1007,32 @@ def main():
         num_workers=args.num_workers)
 
     # ----- Model -----
-    print(f'Loading Swin-S pretrained (num_classes={num_classes}) ...')
-    model = timm.create_model('swin_small_patch4_window7_224', pretrained=True,
-                              num_classes=num_classes)
-    status = init_from_baseline(model)
-    if status == 'loaded':
-        print(f'>>> Initialised from finetuned FP baseline: {DEFAULT_INIT_CKPT}')
-    elif status == 'none':
-        print(f'>>> No {DEFAULT_INIT_CKPT} — using timm-pretrained weights.')
+    if args.init_model:
+        # Quantize a pre-built (e.g. pruned) model saved as a WHOLE object. Its
+        # architecture may differ from stock Swin-S (fewer heads / MLP neurons),
+        # so we load it directly instead of create_model + load_state_dict.
+        print(f'Loading whole model object from {args.init_model} ...')
+        model = torch.load(args.init_model, map_location=device, weights_only=False)
+        if not isinstance(model, nn.Module):
+            raise TypeError(f'--init-model must be a saved nn.Module (torch.save(model)), '
+                            f'got {type(model)}. For a state_dict, use ckpt/best.pth via '
+                            f'init_from_baseline instead.')
+        head = getattr(model, 'head', None)
+        n_out = getattr(getattr(head, 'fc', head), 'out_features', None)
+        if n_out is not None and n_out != num_classes:
+            raise ValueError(f'--init-model has {n_out} output classes but --dataset '
+                             f'{args.dataset} needs {num_classes}. Mismatch.')
+        print(f'>>> Quantizing pre-built model as-is (skipped create_model / '
+              f'init_from_baseline){f", head out={n_out}" if n_out else ""}.')
+    else:
+        print(f'Loading Swin-S pretrained (num_classes={num_classes}) ...')
+        model = timm.create_model('swin_small_patch4_window7_224', pretrained=True,
+                                  num_classes=num_classes)
+        status = init_from_baseline(model)
+        if status == 'loaded':
+            print(f'>>> Initialised from finetuned FP baseline: {DEFAULT_INIT_CKPT}')
+        elif status == 'none':
+            print(f'>>> No {DEFAULT_INIT_CKPT} — using timm-pretrained weights.')
     model.to(device).eval()
 
     # FP baseline
@@ -1000,15 +1041,18 @@ def main():
     print(f'[FP baseline]   top1={t1:.2f}% top5={t5:.2f}% ({n} samples)')
 
     # ----- FIM extraction (needed for partition='fim' OR the DPLR distillation loss) -----
-    need_fim = (args.partition == 'fim') or args.use_dplr_loss
+    # DPLR loss builds its own per-block FIM inside DPLRBlockLoss.initialize() and does
+    # NOT consume this weight-FIM dict — so only partition='fim' actually needs it.
+    # (Previously `or args.use_dplr_loss` triggered a FIM pass that was computed then
+    # discarded — wasteful, and a FULL pass with --importance-full + magnitude.)
+    need_fim = (args.partition == 'fim')
     fim_dict = {}
     if need_fim:
-        why = "partition='fim'" if args.partition == 'fim' else 'DPLR loss'
         over = ('the FULL dataset' if args.importance_full
                 else f'{args.fim_batches} calib batches')
         lr_tag = ' +LR' if args.logits_reversal else ''
         print(f'Computing {args.importance.upper()}{lr_tag}-FIM(W) over {over} '
-              f'(p1={args.fim_p1}, p2={args.fim_p2}) [for {why}] ...')
+              f"(p1={args.fim_p1}, p2={args.fim_p2}) [for partition='fim'] ...")
         t0 = time.time()
         fim_dict = compute_weight_dplr_fim(model, calib_loader, device,
                                             n_batches=args.fim_batches,
@@ -1020,7 +1064,12 @@ def main():
         print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers '
               f'(scope={args.apb_scope})')
     else:
-        print(f"Skipping FIM extraction (partition={args.partition!r}, no DPLR loss).")
+        print(f"Skipping FIM extraction (partition={args.partition!r}).")
+
+    # Snapshot the FP model BEFORE APB, so a pruned --init-model can serve as its
+    # own distillation teacher (deepcopy of the pruned FP net, pre-quantization).
+    fp_teacher_snapshot = (copy.deepcopy(model)
+                           if (args.use_dplr_loss and args.init_model) else None)
 
     # ----- Apply APB -----
     print(f'Applying APB (scope={args.apb_scope}, binary_ratio={args.binary_ratio}, '
@@ -1044,9 +1093,13 @@ def main():
     dplr = None
     if args.use_dplr_loss:
         print('Setting up DPLR-FIM per-block loss (FP teacher + FIM init) ...')
-        model_fp = timm.create_model('swin_small_patch4_window7_224', pretrained=True,
-                                     num_classes=num_classes)
-        init_from_baseline(model_fp)   # teacher must match the student's init
+        if fp_teacher_snapshot is not None:
+            # Pruned student: teacher = the pruned FP net itself (pre-APB snapshot).
+            model_fp = fp_teacher_snapshot
+        else:
+            model_fp = timm.create_model('swin_small_patch4_window7_224', pretrained=True,
+                                         num_classes=num_classes)
+            init_from_baseline(model_fp)   # teacher must match the student's init
         model_fp.to(device).eval()
         dplr = DPLRBlockLoss(model_fp, k=args.fim_batches,
                              p1=args.fim_p1, p2=args.fim_p2)
@@ -1157,7 +1210,7 @@ def main():
             if dplr is not None:
                 pbar.set_postfix(loss=f'{loss.item():.3f}',
                                  ce=f'{loss_ce.item():.3f}',
-                                 dplr=f'{loss_dplr_val:.4f}')
+                                 dplr=f'{args.dplr_lambda * loss_dplr_val:.4f}')
             else:
                 pbar.set_postfix(loss=f'{loss.item():.3f}')
             if args.debug and i >= 5: break
@@ -1170,7 +1223,7 @@ def main():
         dt = time.time() - t0
         if dplr is not None:
             print(f'Ep {ep+1}/{args.epochs}: loss={train_loss:.4f} '
-                  f'(ce={train_ce:.4f} + λ·dplr={train_dplr:.4f}) | '
+                  f'(ce={train_ce:.4f} + λ·dplr={args.dplr_lambda * train_dplr:.4f}) | '
                   f'val top1={t1:.2f}% top5={t5:.2f}% | {dt:.1f}s')
         else:
             print(f'Ep {ep+1}/{args.epochs}: train_loss={train_loss:.4f} | '

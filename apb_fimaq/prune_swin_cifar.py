@@ -20,6 +20,9 @@ python apb_fimaq/prune_swin_cifar.py --rank-mode global --global-metric per_para
 # per_layer
 python apb_fimaq/prune_swin_cifar.py --rank-mode per_layer --head-ratio 0.25 --mlp-ratio 0.25 --fim-batches 10 --epochs 15 --lr 1e-4 --batch-size 64 --num-workers 4 --seed 3407
 
+# magnitude (data-free, no calib pass) — l2sq default; --mag-norm l1 for APB-style |w|
+python apb_fimaq/prune_swin_cifar.py --importance magnitude --rank-mode global --global-metric per_param --head-ratio 0.5 --mlp-ratio 0.5 --mlp-keep-frac 0.05 --epochs 20 --lr 1e-4 --batch-size 64 --num-workers 4 --seed 3407
+
 # quick smoke
 python apb_fimaq/prune_swin_cifar.py --debug
 """
@@ -87,10 +90,17 @@ def main():
                         'confident-correct samples. Orthogonal to --importance; '
                         "--importance fisher + --logits-reversal = paper's Ω^LR.")
     p.add_argument('--importance', '--fim-mode', dest='importance',
-                   choices=['dplr', 'fisher'], default='dplr',
+                   choices=['dplr', 'fisher', 'magnitude'], default='dplr',
                    help="Pruning importance metric. 'dplr' = FIMA-Q-inspired "
                         "p1*E[g^2]+p2*E[|g|] then *E[x^2] (default); 'fisher' = exact "
-                        "empirical Fisher (1/T)*sum_t(g*x)^2. (--fim-mode kept as alias.)")
+                        "empirical Fisher (1/T)*sum_t(g*x)^2; 'magnitude' = data-free "
+                        "weight norm (see --mag-norm), NO calib pass. "
+                        "(--fim-mode kept as alias.)")
+    p.add_argument('--mag-norm', choices=['l2sq', 'l1'], default='l2sq',
+                   help="For --importance magnitude only: aggregate a head/neuron's "
+                        "weights as Sum w^2 (l2sq, default — symmetric with FIM's "
+                        "F*w^2 Taylor term) or Sum |w| (l1 — matches APB's |w| "
+                        "magnitude convention). Ignored for dplr/fisher.")
     p.add_argument('--epochs', type=int, default=15)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight-decay', type=float, default=1e-4)
@@ -146,18 +156,28 @@ def main():
     t1, t5, n = evaluate(model, val_loader, device, max_batches=max_b)
     print(f'[FP baseline]   top1={t1:.2f}% top5={t5:.2f}% ({n} samples)')
 
-    # ----- importance (FIMA-Q-inspired 'dplr' or exact 'fisher') -----
-    over = ('the FULL training set' if args.importance_full
-            else f'{args.fim_batches} batches')
-    lr_tag = ' +LR' if args.logits_reversal else ''
-    print(f'Computing importance over {over} '
-          f'(importance={args.importance}{lr_tag}) ...')
-    t0 = time.time()
-    fim = compute_weight_dplr_fim(model, train_loader, device,
-                                  n_batches=args.fim_batches, fim_mode=args.importance,
-                                  scope='skip', full=args.importance_full,
-                                  logits_reversal=args.logits_reversal)
-    print(f'FIM done in {time.time()-t0:.1f}s, {len(fim)} layers')
+    # ----- importance: data-free 'magnitude' OR calib-based 'dplr'/'fisher' -----
+    if args.importance == 'magnitude':
+        fim = {}
+        ignored = [f for f, on in (('--logits-reversal', args.logits_reversal),
+                                   ('--importance-full', args.importance_full),
+                                   ('--fim-batches', args.fim_batches != 10))
+                   if on]
+        warn = f' (ignoring {", ".join(ignored)} — data-free)' if ignored else ''
+        print(f'Importance: weight-magnitude {args.mag_norm} '
+              f'(data-free, no calib pass){warn}')
+    else:
+        over = ('the FULL training set' if args.importance_full
+                else f'{args.fim_batches} batches')
+        lr_tag = ' +LR' if args.logits_reversal else ''
+        print(f'Computing importance over {over} '
+              f'(importance={args.importance}{lr_tag}) ...')
+        t0 = time.time()
+        fim = compute_weight_dplr_fim(model, train_loader, device,
+                                      n_batches=args.fim_batches, fim_mode=args.importance,
+                                      scope='skip', full=args.importance_full,
+                                      logits_reversal=args.logits_reversal)
+        print(f'FIM done in {time.time()-t0:.1f}s, {len(fim)} layers')
 
     # ----- structural prune -----
     rank_desc = (f'global/{args.global_metric}' if args.rank_mode == 'global'
@@ -168,7 +188,8 @@ def main():
                        mlp_ratio=args.mlp_ratio, min_heads=args.min_heads,
                        rank_mode=args.rank_mode, global_metric=args.global_metric,
                        head_keep_frac=args.head_keep_frac,
-                       mlp_keep_frac=args.mlp_keep_frac)
+                       mlp_keep_frac=args.mlp_keep_frac,
+                       importance=args.importance, mag_norm=args.mag_norm)
     model.to(device)
     print(f'  heads  {stats["heads_before"]} -> {stats["heads_after"]}')
     print(f'  mlp    {stats["mlp_neurons_before"]} -> {stats["mlp_neurons_after"]}')
