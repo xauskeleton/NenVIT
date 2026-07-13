@@ -103,6 +103,8 @@ def main():
                         "F*w^2 Taylor term) or Sum |w| (l1 — matches APB's |w| "
                         "magnitude convention). Ignored for fisher.")
     p.add_argument('--epochs', type=int, default=15)
+    p.add_argument('--patience', type=int, default=5,
+                   help='Early-stop patience: dừng nếu val top1 không cải thiện N epoch (0=tắt, default 5).')
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--label-smoothing', type=float, default=0.1)
@@ -210,6 +212,7 @@ def main():
     print('=' * 60)
 
     best_top1 = 0.0
+    epochs_no_improve = 0
     for ep in range(args.epochs):
         model.train()
         t0 = time.time(); loss_sum = 0; loss_n = 0
@@ -231,10 +234,20 @@ def main():
         t1, t5, n = evaluate(model, val_loader, device, max_batches=max_b)
         print(f'Ep {ep+1}/{args.epochs}: train_loss={loss_sum/loss_n:.4f} | '
               f'val top1={t1:.2f}% top5={t5:.2f}% | {time.time()-t0:.1f}s')
+        improved = t1 > best_top1
         if t1 > best_top1:
             best_top1 = t1
             torch.save(model, out_dir / 'best_pruned_model.pt')  # whole model: shape changed
         torch.save(model, out_dir / 'last_pruned_model.pt')
+        if args.patience > 0:
+            if improved:
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                print(f'  >> no improvement ({epochs_no_improve}/{args.patience}) | best={best_top1:.2f}%')
+                if epochs_no_improve >= args.patience:
+                    print(f'  >> Early stopping at epoch {ep+1} (patience {args.patience}).')
+                    break
 
     print('=' * 60)
     print(f'DONE. Best pruned val top1 = {best_top1:.2f}% '

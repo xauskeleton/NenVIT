@@ -869,6 +869,9 @@ def main():
                         'sweep 4/2. 1 = BinaryActQuant (sign·scale, XNOR/Bi-Real STE) — true 1-bit '
                         'activation; expect a large drop on ViT (two-sided, outlier-heavy acts).')
     p.add_argument('--epochs', type=int, default=10)
+    p.add_argument('--patience', type=int, default=0,
+                   help='Early-stop patience cho QAT (0=TẮT, default). ⚠️ QAT hay tăng ở đuôi '
+                        'LR-decay → tắt mặc định để không cắt sớm; đặt >0 nếu muốn bật.')
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--fim-batches', type=int, default=5,
@@ -1148,6 +1151,7 @@ def main():
     print(f'QAT training: {args.epochs} epochs (start={start_epoch}), lr={args.lr}, '
           f'freeze α at epoch {freeze_at}, dplr={dplr is not None}, amp={use_amp}')
     print(f'='*60)
+    epochs_no_improve = 0
     for ep in range(start_epoch, args.epochs):
         # Periodic mask refresh (FIM recompute only when partition='fisher')
         if (args.recompute_fim_every > 0 and ep > 0
@@ -1228,6 +1232,7 @@ def main():
             print(f'Ep {ep+1}/{args.epochs}: train_loss={train_loss:.4f} | '
                   f'val top1={t1:.2f}% top5={t5:.2f}% | {dt:.1f}s')
 
+        improved = t1 > best_top1
         if t1 > best_top1:
             best_top1 = t1
             torch.save(model.state_dict(), out_dir / 'best.pth')
@@ -1241,6 +1246,15 @@ def main():
             'scaler': scaler.state_dict() if use_amp else None,
             'best_top1': best_top1,
         }, out_dir / 'last.pth')
+        if args.patience > 0:
+            if improved:
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                print(f'  >> no improvement ({epochs_no_improve}/{args.patience}) | best={best_top1:.2f}%')
+                if epochs_no_improve >= args.patience:
+                    print(f'  >> Early stopping at epoch {ep+1} (patience {args.patience}).')
+                    break
 
     print(f'='*60)
     print(f'DONE. Best val top1 = {best_top1:.2f}%')
