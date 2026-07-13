@@ -57,12 +57,15 @@ echo " quant: scope=full br=$BR act=$ACT_BITS dplr_lambda=$DPLR_LAMBDA"
 echo " quick=${QUICK:-0}"
 echo "=============================================================="
 
-# ---- Stage 1: FP baseline (bỏ qua nếu đã có) ----
+# ---- Stage 1: FP baseline (auto-skip nếu đã có; FORCE=1 để chạy lại) ----
 BASELINE="${BASELINE:-}"
 if [ -z "$BASELINE" ]; then
   if [ "$MODEL" = "swin_small_patch4_window7_224" ] && [ -f ckpt/best_swin.pth ]; then
     BASELINE="ckpt/best_swin.pth"
     echo ">> Stage 1 SKIP — tái dùng baseline Swin có sẵn: $BASELINE"
+  elif [ "${FORCE:-0}" != "1" ] && [ -f "$OUT/ft/best.pth" ]; then
+    BASELINE="$OUT/ft/best.pth"
+    echo ">> Stage 1 SKIP — baseline đã có: $BASELINE  (FORCE=1 để chạy lại)"
   else
     echo ">> Stage 1: finetune FP baseline -> $OUT/ft/best.pth"
     "$PY" apb_fimaq/finetune.py --model "$MODEL" --dataset "$DATASET" \
@@ -72,16 +75,19 @@ if [ -z "$BASELINE" ]; then
   fi
 fi
 
-# ---- Stage 2: structural prune (fisher) ----
-echo ">> Stage 2: prune (fisher, $RANK_MODE) -> $OUT/pruned/best_pruned_model.pt"
-"$PY" apb_fimaq/prune_cifar.py --model "$MODEL" --dataset "$DATASET" \
-  --baseline-ckpt "$BASELINE" \
-  --importance fisher --rank-mode "$RANK_MODE" --global-metric per_param \
-  --head-ratio "$HEAD_RATIO" --mlp-ratio "$MLP_RATIO" --mlp-keep-frac "$MLP_KEEP_FRAC" \
-  --epochs "$PRUNE_EPOCHS" --batch-size "$BATCH" --seed "$SEED" \
-  --out-dir "$OUT/pruned" $DBG
-
+# ---- Stage 2: structural prune (fisher) — auto-skip nếu pruned model đã có ----
 PRUNED="$OUT/pruned/best_pruned_model.pt"
+if [ "${FORCE:-0}" != "1" ] && [ -f "$PRUNED" ]; then
+  echo ">> Stage 2 SKIP — pruned model đã có: $PRUNED  (FORCE=1 để chạy lại)"
+else
+  echo ">> Stage 2: prune (fisher, $RANK_MODE) -> $PRUNED"
+  "$PY" apb_fimaq/prune_cifar.py --model "$MODEL" --dataset "$DATASET" \
+    --baseline-ckpt "$BASELINE" \
+    --importance fisher --rank-mode "$RANK_MODE" --global-metric per_param \
+    --head-ratio "$HEAD_RATIO" --mlp-ratio "$MLP_RATIO" --mlp-keep-frac "$MLP_KEEP_FRAC" \
+    --epochs "$PRUNE_EPOCHS" --batch-size "$BATCH" --seed "$SEED" \
+    --out-dir "$OUT/pruned" $DBG
+fi
 
 # ---- Stage 3: APB-QAT trên model đã prune (magnitude + DPLR) ----
 echo ">> Stage 3: APB-QAT (magnitude+DPLR) -> $OUT/prune_quant/best.pth"
