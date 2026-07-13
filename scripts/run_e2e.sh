@@ -91,15 +91,18 @@ else
 fi
 
 # ---- Stage 3: APB-QAT trên model đã prune (magnitude + DPLR) ----
-echo ">> Stage 3: APB-QAT (magnitude+DPLR) -> $OUT/prune_quant/best.pth"
+# out-dir gồm br/act → chạy e2e nhiều lần với BR/ACT khác nhau KHÔNG đè nhau
+# (baseline+prune auto-skip vì đã có; chỉ quant chạy lại → 1 prune, nhiều quant).
+QOUT="$OUT/prune_quant_br${BR}_act${ACT_BITS}"
+echo ">> Stage 3: APB-QAT (magnitude+DPLR) -> $QOUT/best.pth"
 "$PY" apb_fimaq/qat.py --model "$MODEL" --dataset "$DATASET" \
   --init-model "$PRUNED" \
   --partition magnitude --binary-ratio "$BR" --act-bits "$ACT_BITS" \
   --use-dplr-loss --dplr-lambda "$DPLR_LAMBDA" \
   --epochs "$QAT_EPOCHS" --batch-size "$BATCH" --seed "$SEED" --patience "$PATIENCE" \
-  --out-dir "$OUT/prune_quant" $DBG
+  --out-dir "$QOUT" $DBG
 
 echo "=============================================================="
-echo " DONE. Kết quả cuối: $OUT/prune_quant/best.pth (+ best_packed.pt)"
+echo " DONE. Kết quả cuối: $QOUT/best.pth (+ best_packed.pt)"
 echo " Baseline: $BASELINE | Pruned: $PRUNED"
 echo "=============================================================="
