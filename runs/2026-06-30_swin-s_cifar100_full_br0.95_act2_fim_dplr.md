@@ -1,5 +1,7 @@
 # Swin-S APB W+A — CIFAR-100 (br0.95 / full / act 2-bit / **fim / +DPLR λ=3000**)
 
+> ⛔ **DEPRECATED partition (2026-07-13):** `--partition fim` ở đây = **dplr** (bản tự chế) → số partition KHÔNG dùng làm bằng chứng nữa; đại diện FIM đúng = `fisher` (`--partition fisher`) — A2 đã có (Kaggle): **magnitude > fisher** (xem `2026-07-03_..._A2_fisher_partition...` + `../ABLATIONS.md`). *(DPLR **loss** λ=3000 vẫn hợp lệ.)*
+
 Run date: 2026-06-30 (~11.5h) | Script: `apb_fimaq/qat.py` | `--partition fim --act-bits 2 --use-dplr-loss --dplr-lambda 3000`
 Init-baseline (FP 90.88%). Ô fim+DPLR của bộ **br0.95 + act2**. Distillation DPLR-FIM per-block từ FP teacher.
 

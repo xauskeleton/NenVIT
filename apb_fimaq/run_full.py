@@ -15,8 +15,7 @@ from pathlib import Path
 # CONFIG — chỉnh ở đây
 # ============================================================
 CONFIG = {
-    # APB
-    'apb_scope':          'skip',  # 'skip' = 96 layers (safe) | 'full' = 100 layers (incl head + downsample)
+    # APB — scope luôn full (100 Linears, gồm head + downsample); flag --apb-scope đã bỏ.
     'binary_ratio':       0.75,    # % weights binarize
     # Training
     'epochs':             20,      # số epoch

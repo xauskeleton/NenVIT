@@ -1,10 +1,11 @@
 """
-Standalone FIMA-Q PTQ on CIFAR-100 / Swin-S, reusing FIMA-Q/ utils UNMODIFIED.
+Standalone FIMA-Q PTQ on CIFAR-100, reusing FIMA-Q/ utils UNMODIFIED. Model via --model
+(default Swin-S; FIMA-Q wrap also supports the ViT/DeiT families with a matching --ckpt).
 
 Per project rule (keep FIMA-Q/ pristine): this wrapper lives in apb_fimaq/ and only
 *imports* FIMA-Q code. It swaps FIMA-Q's hardcoded ImageNet loader for a CIFAR-100
 loader (32->224 bicubic, ImageNet-norm — same transform as our finetune/qat pipeline)
-and loads the CIFAR-100 finetuned Swin-S baseline (ckpt/best.pth, 90.88%).
+and loads the CIFAR-100 finetuned Swin-S baseline (ckpt/best_swin.pth, 90.88%).
 
 This is the PTQ-only baseline (no QAT, no APB) to compare against APB+QAT at low bits.
 
@@ -37,7 +38,7 @@ from utils.test_utils import validate              # noqa: E402
 from torchvision import transforms                 # noqa: E402
 from torchvision.datasets import CIFAR100          # noqa: E402
 
-CKPT = ROOT / 'ckpt' / 'best.pth'
+CKPT = ROOT / 'ckpt' / 'best_swin.pth'
 DATA_DIR = ROOT / 'data'
 
 
@@ -106,6 +107,13 @@ class CifarLoaderFimaq(LoaderGenerator):
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument('--model', type=str, default='swin_small_patch4_window7_224',
+                   help='timm model (default swin_small_patch4_window7_224). FIMA-Q '
+                        'wrap supports the Swin/ViT/DeiT families; use a matching '
+                        '--ckpt baseline.')
+    p.add_argument('--ckpt', type=str, default=str(CKPT),
+                   help='Finetuned FP baseline state_dict for --model (default '
+                        'ckpt/best_swin.pth, the Swin-S CIFAR-100 90.88% baseline).')
     p.add_argument('--w-bit', type=int, default=2)
     p.add_argument('--a-bit', type=int, default=2)
     p.add_argument('--optimize', action='store_true',
@@ -135,20 +143,20 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print('=' * 60)
-    print(f'FIMA-Q PTQ on Swin-S | CIFAR-100 | W{args.w_bit}/A{args.a_bit} | device={device}')
+    print(f'FIMA-Q PTQ on {args.model} | CIFAR-100 | W{args.w_bit}/A{args.a_bit} | device={device}')
     print(f'optimize(Fisher-DPLR)={args.optimize} | calib={args.calib_size} '
           f'optim={args.optim_size} | seed={args.seed}')
     print('=' * 60)
 
-    # ----- model: CIFAR-100 finetuned Swin-S (90.88% baseline) -----
-    model = timm.create_model('swin_small_patch4_window7_224',
-                              pretrained=True, num_classes=100)
-    assert CKPT.exists(), f'Missing baseline checkpoint: {CKPT}'
-    sd = torch.load(CKPT, map_location='cpu')
+    # ----- model: CIFAR-100 finetuned baseline (default Swin-S, 90.88%) -----
+    ckpt = Path(args.ckpt)
+    model = timm.create_model(args.model, pretrained=True, num_classes=100)
+    assert ckpt.exists(), f'Missing baseline checkpoint: {ckpt}'
+    sd = torch.load(ckpt, map_location='cpu')
     if isinstance(sd, dict) and 'model' in sd:
         sd = sd['model']
     model.load_state_dict(sd, strict=True)
-    print(f'>>> Loaded CIFAR-100 baseline: {CKPT}')
+    print(f'>>> Loaded CIFAR-100 baseline: {ckpt}')
     model.to(device).eval()
 
     cfg = Config(args.w_bit, args.a_bit, args.calib_size,

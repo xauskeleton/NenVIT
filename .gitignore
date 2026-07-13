@@ -71,3 +71,6 @@ runs_test/
 
 # Unrelated binaries (e.g. Minecraft OptiFine mod) — keep research repo clean
 *.jar
+
+# wandb local runs
+wandb/

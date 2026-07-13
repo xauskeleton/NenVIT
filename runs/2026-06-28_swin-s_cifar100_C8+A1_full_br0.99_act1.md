@@ -1,5 +1,7 @@
 # Swin-S APB W+A quant — CIFAR-100 (C8+A1: full / br0.99 / DPLR / **act 1-bit binary**)
 
+> ⛔ **DEPRECATED partition (2026-07-13):** partition mặc định lúc này = **fim = dplr** (bản tự chế) → số partition KHÔNG dùng làm bằng chứng nữa; đại diện FIM đúng = `fisher` (`--partition fisher`) — A2 đã có (Kaggle): **magnitude > fisher** (xem `2026-07-03_..._A2_fisher_partition...` + `../ABLATIONS.md`). *(DPLR **loss** vẫn hợp lệ.)*
+
 Run date: 2026-06-28 (~9.3h) | Script: `apb_fimaq/qat.py`
 Activation quant **BinaryActQuant 1-bit** (sign·scale, XNOR/Bi-Real STE; scope A = input 100 APB Linear, full).
 Base = C8 (weight-only). **Khác A2/A8: 1-bit không dùng LSQ** (LSQ degenerate ở 1-bit, Qp=0) → routing sang

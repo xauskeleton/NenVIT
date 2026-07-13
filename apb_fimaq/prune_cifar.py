@@ -1,8 +1,9 @@
 """
-FIMA-Q-guided structural pruning of Swin-S on CIFAR-100 (standalone, no quant).
+FIMA-Q-guided structural pruning of Swin / ViT (DeiT) on CIFAR-100 (standalone, no quant).
+Model chosen with --model (default swin_small_patch4_window7_224).
 
 Pipeline (matches the 'prune + finetune separately first' plan):
-  1. load CIFAR-100 finetuned baseline (ckpt/best.pth, 90.88%)
+  1. load CIFAR-100 finetuned baseline (ckpt/best_swin.pth, 90.88%)
   2. compute DPLR-FIM importance (FIMA-Q) on a few calib batches
   3. structurally prune heads + MLP neurons per block (lowest-FIM dropped)
   4. eval right after prune  -> 'prune cost' before recovery
@@ -15,16 +16,16 @@ Combine with quant later by feeding the saved pruned best.pth into qat.py.
 USAGE
 =====
 # global (recommended)
-python apb_fimaq/prune_swin_cifar.py --rank-mode global --global-metric per_param --head-ratio 0.25 --mlp-ratio 0.25 --min-heads 1 --mlp-keep-frac 0.05 --fim-batches 10 --epochs 15 --lr 1e-4 --batch-size 64 --num-workers 4 --seed 3407
+python apb_fimaq/prune_cifar.py --rank-mode global --global-metric per_param --head-ratio 0.25 --mlp-ratio 0.25 --min-heads 1 --mlp-keep-frac 0.05 --fim-batches 10 --epochs 15 --lr 1e-4 --batch-size 64 --num-workers 4 --seed 3407
 
 # per_layer
-python apb_fimaq/prune_swin_cifar.py --rank-mode per_layer --head-ratio 0.25 --mlp-ratio 0.25 --fim-batches 10 --epochs 15 --lr 1e-4 --batch-size 64 --num-workers 4 --seed 3407
+python apb_fimaq/prune_cifar.py --rank-mode per_layer --head-ratio 0.25 --mlp-ratio 0.25 --fim-batches 10 --epochs 15 --lr 1e-4 --batch-size 64 --num-workers 4 --seed 3407
 
 # magnitude (data-free, no calib pass) — l2sq default; --mag-norm l1 for APB-style |w|
-python apb_fimaq/prune_swin_cifar.py --importance magnitude --rank-mode global --global-metric per_param --head-ratio 0.5 --mlp-ratio 0.5 --mlp-keep-frac 0.05 --epochs 20 --lr 1e-4 --batch-size 64 --num-workers 4 --seed 3407
+python apb_fimaq/prune_cifar.py --importance magnitude --rank-mode global --global-metric per_param --head-ratio 0.5 --mlp-ratio 0.5 --mlp-keep-frac 0.05 --epochs 20 --lr 1e-4 --batch-size 64 --num-workers 4 --seed 3407
 
 # quick smoke
-python apb_fimaq/prune_swin_cifar.py --debug
+python apb_fimaq/prune_cifar.py --debug
 """
 import argparse
 import sys
@@ -46,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qat import (evaluate, _Tee, compute_weight_dplr_fim,        # noqa: E402
                  init_from_baseline)
 from finetune import build_data                                  # noqa: E402
-from prune import prune_swin                                     # noqa: E402
+from prune import prune_transformer                             # noqa: E402
 
 MODEL = 'swin_small_patch4_window7_224'
 
@@ -56,6 +57,13 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--dataset', choices=['cifar10', 'cifar100'], default='cifar100')
     p.add_argument('--data-dir', type=str, default='')
+    p.add_argument('--model', type=str, default=MODEL,
+                   help=f'timm model to prune (default {MODEL}). Also supports plain '
+                        'ViT/DeiT, e.g. deit_small_patch16_224 — head/MLP pruning '
+                        'generalises across Swin/ViT.')
+    p.add_argument('--baseline-ckpt', type=str, default='',
+                   help='Finetuned FP baseline state_dict for THIS model (overrides the '
+                        'default Swin ckpt/best_swin.pth). E.g. ckpt_deit/best.pth.')
     p.add_argument('--head-ratio', type=float, default=0.25,
                    help='Fraction of attention heads to prune PER BLOCK.')
     p.add_argument('--mlp-ratio', type=float, default=0.25,
@@ -82,25 +90,18 @@ def main():
                         '(one full pass) instead of --fim-batches calib batches. '
                         'Exact importance, no sampling error (recommended with '
                         '--importance fisher).')
-    p.add_argument('--logits-reversal', dest='logits_reversal',
-                   action='store_true',
-                   help='Logits Reversal (arXiv 2603.18596, "EWC Done Right"): negate '
-                        'logits before the CE loss when computing importance, so '
-                        'grad = y_k - softmax(-z)_k. Fixes gradient-vanishing on '
-                        'confident-correct samples. Orthogonal to --importance; '
-                        "--importance fisher + --logits-reversal = paper's Ω^LR.")
     p.add_argument('--importance', '--fim-mode', dest='importance',
-                   choices=['dplr', 'fisher', 'magnitude'], default='dplr',
-                   help="Pruning importance metric. 'dplr' = FIMA-Q-inspired "
-                        "p1*E[g^2]+p2*E[|g|] then *E[x^2] (default); 'fisher' = exact "
-                        "empirical Fisher (1/T)*sum_t(g*x)^2; 'magnitude' = data-free "
-                        "weight norm (see --mag-norm), NO calib pass. "
-                        "(--fim-mode kept as alias.)")
+                   choices=['fisher', 'magnitude'], default='fisher',
+                   help="Pruning importance metric. 'fisher' = exact empirical Fisher "
+                        "(1/T)*sum_t(g*x)^2 (DEFAULT, chosen 2026-07-11); 'magnitude' = "
+                        "data-free weight norm (see --mag-norm), NO calib pass. "
+                        "The 'dplr' variant was REMOVED 2026-07-13 (self-devised, not used "
+                        "for ranking). (--fim-mode kept as alias.)")
     p.add_argument('--mag-norm', choices=['l2sq', 'l1'], default='l2sq',
                    help="For --importance magnitude only: aggregate a head/neuron's "
                         "weights as Sum w^2 (l2sq, default — symmetric with FIM's "
                         "F*w^2 Taylor term) or Sum |w| (l1 — matches APB's |w| "
-                        "magnitude convention). Ignored for dplr/fisher.")
+                        "magnitude convention). Ignored for fisher.")
     p.add_argument('--epochs', type=int, default=15)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight-decay', type=float, default=1e-4)
@@ -136,18 +137,19 @@ def main():
               f'(log → {log_path}) =====')
 
     print('=' * 60)
-    print(f'FIMA-Q-guided structural prune | Swin-S | device={device}')
+    print(f'FIMA-Q-guided structural prune | {args.model} | device={device}')
     print(f'Args: {vars(args)}')
     print('=' * 60)
 
     train_loader, val_loader, num_classes = build_data(args)
     max_b = 10 if args.debug else None
 
-    print(f'Loading Swin-S (num_classes={num_classes}) ...')
-    model = timm.create_model(MODEL, pretrained=True, num_classes=num_classes)
-    status = init_from_baseline(model)
+    print(f'Loading {args.model} (num_classes={num_classes}) ...')
+    model = timm.create_model(args.model, pretrained=True, num_classes=num_classes)
+    baseline_path = args.baseline_ckpt or None
+    status = init_from_baseline(model, baseline_path)
     if status == 'loaded':
-        print(f'>>> Initialised from CIFAR baseline: {PROJECT_ROOT/"ckpt"/"best.pth"}')
+        print(f'>>> Initialised from CIFAR baseline: {baseline_path or PROJECT_ROOT/"ckpt"/"best_swin.pth"}')
     else:
         print(f'>>> No/incompatible baseline ({status}) — using pretrained '
               f'(head random; numbers only relative).')
@@ -159,8 +161,7 @@ def main():
     # ----- importance: data-free 'magnitude' OR calib-based 'dplr'/'fisher' -----
     if args.importance == 'magnitude':
         fim = {}
-        ignored = [f for f, on in (('--logits-reversal', args.logits_reversal),
-                                   ('--importance-full', args.importance_full),
+        ignored = [f for f, on in (('--importance-full', args.importance_full),
                                    ('--fim-batches', args.fim_batches != 10))
                    if on]
         warn = f' (ignoring {", ".join(ignored)} — data-free)' if ignored else ''
@@ -169,14 +170,12 @@ def main():
     else:
         over = ('the FULL training set' if args.importance_full
                 else f'{args.fim_batches} batches')
-        lr_tag = ' +LR' if args.logits_reversal else ''
         print(f'Computing importance over {over} '
-              f'(importance={args.importance}{lr_tag}) ...')
+              f'(importance={args.importance}) ...')
         t0 = time.time()
         fim = compute_weight_dplr_fim(model, train_loader, device,
                                       n_batches=args.fim_batches, fim_mode=args.importance,
-                                      scope='skip', full=args.importance_full,
-                                      logits_reversal=args.logits_reversal)
+                                      scope='skip', full=args.importance_full)
         print(f'FIM done in {time.time()-t0:.1f}s, {len(fim)} layers')
 
     # ----- structural prune -----
@@ -184,7 +183,7 @@ def main():
                  else 'per_layer')
     print(f'Pruning: head_ratio={args.head_ratio}, mlp_ratio={args.mlp_ratio}, '
           f'rank={rank_desc} (lowest-FIM dropped) ...')
-    stats = prune_swin(model, fim, head_ratio=args.head_ratio,
+    stats = prune_transformer(model, fim, head_ratio=args.head_ratio,
                        mlp_ratio=args.mlp_ratio, min_heads=args.min_heads,
                        rank_mode=args.rank_mode, global_metric=args.global_metric,
                        head_keep_frac=args.head_keep_frac,

@@ -1,5 +1,6 @@
 """
-APB QAT on Swin-S — DPLR-FIM-based partition + end-to-end fine-tuning.
+APB QAT on Swin / ViT (DeiT) — DPLR-FIM-based partition + end-to-end fine-tuning.
+Model chosen with --model (default swin_small_patch4_window7_224).
 
 Importance ranking uses FIMA-Q's DPLR-FIM (Diagonal + Low-Rank, paper Eq 20-21):
     F_DPLR(W_ij) = (p1 · E[(∇z_i)²]  +  p2 · E[|∇z_i|]) · E[x_j²]
@@ -7,7 +8,7 @@ Importance ranking uses FIMA-Q's DPLR-FIM (Diagonal + Low-Rank, paper Eq 20-21):
     Mask = (F_DPLR < τ percentile)
 
 Flow:
-  1. Load pretrained Swin-S
+  1. Load pretrained model (Swin/ViT/DeiT via --model)
   2. Compute DPLR-FIM (k=5 gradient samples by default, ~5 forward+backward)
   3. For each target Linear (96 of them, skip head/downsample/patch_embed):
         mask = (F_DPLR(W) < τ)
@@ -56,26 +57,31 @@ sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))
 # Finetuned FP baseline. QAT initialises from this (if present & shape-compatible)
 # instead of raw timm-pretrained weights, so quantization starts from a model that is
 # already trained for the target dataset (e.g. the CIFAR head is no longer random).
-DEFAULT_INIT_CKPT = PROJECT_ROOT / 'ckpt' / 'best.pth'
+DEFAULT_INIT_CKPT = PROJECT_ROOT / 'ckpt' / 'best_swin.pth'
 
 
-def init_from_baseline(model):
-    """Load DEFAULT_INIT_CKPT into `model` in-place if it exists and fits.
+def init_from_baseline(model, ckpt_path=None):
+    """Load a finetuned FP baseline state_dict into `model` in-place if it exists and fits.
+
+    ckpt_path overrides DEFAULT_INIT_CKPT (ckpt/best_swin.pth, the Swin-S baseline) — pass a
+    per-architecture baseline (e.g. ckpt_deit/best.pth) so different model families keep
+    their own baseline instead of clobbering Swin's.
 
     Returns 'loaded' on success, 'none' if no checkpoint file, or 'mismatch' if the
-    saved weights are shape-incompatible (e.g. ckpt is cifar100/100-class but the run
-    is tiny/1000-class) — in which case the model keeps its timm-pretrained weights.
+    saved weights are shape-incompatible (e.g. a Swin ckpt against a DeiT model, or
+    cifar100/100-class ckpt against a tiny/1000-class run) — model keeps timm-pretrained.
     """
-    if not DEFAULT_INIT_CKPT.exists():
+    ckpt = Path(ckpt_path) if ckpt_path else DEFAULT_INIT_CKPT
+    if not ckpt.exists():
         return 'none'
-    sd = torch.load(DEFAULT_INIT_CKPT, map_location='cpu')
+    sd = torch.load(ckpt, map_location='cpu')
     if isinstance(sd, dict) and 'model' in sd:   # tolerate a last.pth-style checkpoint
         sd = sd['model']
     try:
         model.load_state_dict(sd, strict=True)
         return 'loaded'
     except RuntimeError as e:
-        print(f'!! {DEFAULT_INIT_CKPT.name} incompatible with current model, keeping '
+        print(f'!! {ckpt.name} incompatible with current model, keeping '
               f'timm-pretrained: {str(e).splitlines()[0]}')
         return 'mismatch'
 
@@ -340,7 +346,7 @@ def get_target_layers(model: nn.Module, scope: str = 'skip') -> dict:
 # ============================================================
 def compute_weight_dplr_fim(model, calib_loader, device,
                              n_batches=5, p1=1.0, p2=1.0, fim_mode='dplr',
-                             scope='skip', full=False, logits_reversal=False):
+                             scope='skip', full=False):
     """
     Compute DPLR-FIM-based importance for each target Linear's weights.
 
@@ -360,13 +366,6 @@ def compute_weight_dplr_fim(model, calib_loader, device,
       n_batches: number of (forward + backward) calibration batches (ignored if full=True)
       full: if True, ignore n_batches and make ONE pass over the ENTIRE loader —
         exact importance with no calibration sampling error (esp. for 'fisher').
-      logits_reversal: if True, negate the logits before the CE loss (Logits
-        Reversal, arXiv 2603.18596 "EWC Done Right"). The backward gradient at
-        each logit becomes (y_k - softmax(-z)_k) instead of (softmax(z)_k - y_k),
-        which avoids the gradient-vanishing of standard FIM on confident-correct
-        samples. ORTHOGONAL to fim_mode: it only changes the loss whose gradient
-        `g` feeds the estimator, so it composes with dplr/fisher/rank/diag.
-        fim_mode='fisher' + logits_reversal reproduces the paper's Ω^LR.
       p1: weight for rank-k (L2) component
       p2: weight for diag (L1) component
       fim_mode: 'dplr' | 'rank' | 'diag' | 'fisher' — switch for ablation
@@ -428,8 +427,6 @@ def compute_weight_dplr_fim(model, calib_loader, device,
         model.zero_grad()
         x = x.to(device); y = y.to(device)
         logits = model(x)
-        if logits_reversal:              # arXiv 2603.18596: CE(-z, y) → grad = y_k - softmax(-z)_k
-            logits = -logits
         loss = crit(logits, y)
         loss.backward()
         n_samples += x.size(0)
@@ -470,23 +467,23 @@ def _partition_score(weight, fim, partition):
     """Per-weight importance for the APB partition. Convention: LOW score → binarize,
     HIGH score (top `1-binary_ratio`) → kept full-precision outlier.
 
-      'fim'       → FIMA-Q importance (our method; needs precomputed `fim`)
+      'fisher'    → empirical-Fisher importance (FIM-guided, our method; needs precomputed `fim`)
       'magnitude' → |w| (pure APB: keep the largest-magnitude weights FP)
 
     Returns a CPU float tensor shaped like the weight (out, in)."""
-    if partition == 'fim':
+    if partition == 'fisher':
         if fim is None:
-            raise ValueError("partition='fim' needs a FIM dict for this layer")
+            raise ValueError("partition='fisher' needs a FIM dict for this layer")
         return fim.float()
     if partition == 'magnitude':
         return weight.detach().abs().float().cpu()
-    raise ValueError(f'partition must be fim|magnitude, got {partition!r}')
+    raise ValueError(f'partition must be fisher|magnitude, got {partition!r}')
 
 
 def apply_apb(model, fim_dict, binary_ratio, device, scope='skip', act_bits=0,
-              partition='fim'):
+              partition='magnitude'):
     """Wrap each target Linear with APBLinear using a `partition`-percentile mask.
-    partition: 'fim' (FIMA-Q, default) or 'magnitude' (pure APB).
+    partition: 'fisher' (FIM-guided) or 'magnitude' (pure APB, default).
     act_bits: LSQ activation bit-width on each wrapped layer's input (0/32 = off)."""
     targets = get_target_layers(model, scope=scope)
     for name, mod in targets.items():
@@ -506,7 +503,7 @@ def apply_apb(model, fim_dict, binary_ratio, device, scope='skip', act_bits=0,
     return model
 
 
-def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip', partition='fim'):
+def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip', partition='magnitude'):
     """Refresh masks of APBLinear layers in-place using the chosen `partition` score.
     Keeps latent_weight, α, and structure intact — only mask buffer changes."""
     n_updated = 0
@@ -515,7 +512,7 @@ def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip', partition
     for name, mod in get_target_layers(model, scope=scope).items():
         if not isinstance(mod, APBLinear):
             continue
-        if partition == 'fim' and name not in fim_dict:
+        if partition == 'fisher' and name not in fim_dict:
             continue
         fim = fim_dict.get(name) if fim_dict else None
         score = _partition_score(mod.latent_weight, fim, partition).to(mod.mask.device)
@@ -535,11 +532,18 @@ def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip', partition
 # DPLR-FIM PER-BLOCK LOSS (distillation from FP teacher during QAT)
 # Implements FIMA-Q paper Eq (21): L_DPLR = p1·L_rank-k + p2·L_diag
 # ============================================================
-def get_swin_blocks(model: nn.Module) -> dict:
-    """Return {name: SwinTransformerBlock} from a timm Swin model."""
+def get_transformer_blocks(model: nn.Module) -> dict:
+    """Return {name: block} of transformer blocks — works for both timm Swin
+    (SwinTransformerBlock) and plain ViT/DeiT (vision_transformer.Block). Used by
+    the DPLR per-block distillation loss, so it must span every supported family."""
     import timm.models.swin_transformer as _swin
-    return {n: m for n, m in model.named_modules()
-            if isinstance(m, _swin.SwinTransformerBlock)}
+    import timm.models.vision_transformer as _vit
+    block_types = (_swin.SwinTransformerBlock, _vit.Block)
+    return {n: m for n, m in model.named_modules() if isinstance(m, block_types)}
+
+
+# Backward-compat alias: this used to be Swin-only and named get_swin_blocks.
+get_swin_blocks = get_transformer_blocks
 
 
 class DPLRBlockLoss(nn.Module):
@@ -547,7 +551,7 @@ class DPLRBlockLoss(nn.Module):
     Per-block DPLR-FIM loss for QAT.
 
     Initialization (once, after APB applied):
-      For each Swin block, collect k pairs of (Δz, ∇L) by running k batches of
+      For each transformer block, collect k pairs of (Δz, ∇L) by running k batches of
       forward+backward (CE loss) on the current APB model with FP teacher.
       Store: G shape (k, N), D shape (k, N), inv_B shape (k, k), diag shape (N,).
 
@@ -584,8 +588,8 @@ class DPLRBlockLoss(nn.Module):
 
     def install_hooks(self, model_apb: nn.Module):
         if self._installed: return
-        blocks_apb = get_swin_blocks(model_apb)
-        blocks_fp  = get_swin_blocks(self.model_fp)
+        blocks_apb = get_transformer_blocks(model_apb)
+        blocks_fp  = get_transformer_blocks(self.model_fp)
         assert set(blocks_apb) == set(blocks_fp), 'block names mismatch FP vs APB'
         for n, m in blocks_apb.items():
             m.register_forward_hook(self._make_cache_hook(self.z_apb_cache, n))
@@ -600,7 +604,7 @@ class DPLRBlockLoss(nn.Module):
     def initialize(self, model_apb: nn.Module, calib_loader, device):
         """Collect k FIM samples per block (paper-style, Section 3.3)."""
         self.install_hooks(model_apb)
-        blocks_apb = get_swin_blocks(model_apb)
+        blocks_apb = get_transformer_blocks(model_apb)
 
         # Backward hooks to capture gradient at block output
         grad_cache = {}
@@ -812,9 +816,9 @@ def actual_effective_bits(packed: dict, file_bytes: int) -> dict:
                        Higher than the 'theoretical' number because fp_positions
                        are stored as int32 (32 bit) instead of b_p≈20 bit.
       - whole_bpw    : full file size × 8 ÷ ALL model weights (APB + _other).
-                       This is the honest "how many bits/weight did we ship",
-                       and it DOES change with --apb-scope (skip keeps the 3
-                       downsample.reduction layers as fp32 in _other).
+                       This is the honest "how many bits/weight did we ship"
+                       (APB scope is always full: head.fc + downsample.reduction are
+                       quantized too, only LN/biases remain fp32 in _other).
     """
     def _nbytes(t):
         return t.numel() * t.element_size() if torch.is_tensor(t) else 0
@@ -839,17 +843,25 @@ def actual_effective_bits(packed: dict, file_bytes: int) -> dict:
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--model', type=str, default='swin_small_patch4_window7_224',
+                   help='timm model name (default swin_small_patch4_window7_224). Also '
+                        'supports plain ViT/DeiT, e.g. deit_small_patch16_224, '
+                        'vit_small_patch16_224 — APB wrap, FIM, DPLR per-block loss and '
+                        'pruning all generalise across the Swin/ViT families. Ignored '
+                        'when --init-model loads a whole saved model object.')
+    p.add_argument('--baseline-ckpt', type=str, default='',
+                   help='Path to a finetuned FP baseline state_dict for THIS model '
+                        '(overrides the default Swin ckpt/best_swin.pth). Use a per-arch '
+                        'baseline, e.g. ckpt_deit/best.pth, so QAT starts from a trained '
+                        'model. Empty = use default ckpt/best_swin.pth (Swin-S).')
     p.add_argument('--binary-ratio', type=float, default=0.75,
                    help='Fraction of weights to binarize (default 0.75)')
-    p.add_argument('--apb-scope', choices=['skip', 'full'], default='skip',
-                   help='Layer scope for APB. '
-                        '"skip" = 96 Linears (default; safe, skips head + 3 downsample + patch_embed). '
-                        '"full" = 100 Linears (aggressive; includes head.fc + downsample.reduction).')
-    p.add_argument('--partition', choices=['fim', 'magnitude'], default='fim',
-                   help='Criterion for the APB binary/FP partition (which weights stay FP outliers). '
-                        '"fim" = FIMA-Q importance (default, our method). '
-                        '"magnitude" = keep largest-|w| FP (PURE APB baseline). '
-                        'magnitude skips FIM extraction unless --use-dplr-loss needs it.')
+    p.add_argument('--partition', choices=['fisher', 'magnitude'], default='magnitude',
+                   help='APB binary/FP partition criterion (which weights stay FP outliers). '
+                        '"magnitude" = keep largest-|w| FP (standard APB; DEFAULT). '
+                        '"fisher" = keep highest empirical-Fisher weights FP (FIM-guided, our method; '
+                        'needs a FIM pass). Renamed from "fim" 2026-07-13: the ambiguous "fim" name '
+                        '(defaulted to self-devised dplr) was dropped — only rigorous fisher.')
     p.add_argument('--act-bits', type=int, default=0,
                    help='Activation quant bit-width on the INPUT activations of each APB '
                         'Linear. 0 or 32 = OFF (weight-only APB, default, backward-compatible). '
@@ -868,22 +880,11 @@ def main():
                         'For exact importance with no sampling error (recommended with '
                         "--importance fisher). Independent of --fim-batches, which still "
                         'sets rank k for the DPLR loss.')
-    p.add_argument('--logits-reversal', dest='logits_reversal',
-                   action='store_true',
-                   help='Logits Reversal for importance (arXiv 2603.18596, "EWC Done '
-                        'Right"): negate logits before the CE loss when extracting the '
-                        'FIM, so grad = y_k - softmax(-z)_k. Fixes gradient-vanishing on '
-                        'confident-correct samples. ORTHOGONAL to --importance (only '
-                        'changes the loss for importance/partition, NOT the DPLR '
-                        'distillation loss). --importance fisher + --logits-reversal '
-                        "reproduces the paper's Ω^LR.")
     p.add_argument('--importance', '--fim-mode', dest='importance', type=str,
-                   default='dplr', choices=['dplr', 'fisher'],
-                   help="Importance metric for the APB bit-partition: 'dplr' (default, "
-                        "FIMA-Q-inspired p1*E[g^2]+p2*E[|g|] then *E[x^2]) or 'fisher' "
-                        "(exact empirical Fisher, per-token, no g-x independence "
-                        "factorization). rank/diag still reachable via dplr with "
-                        "--fim-p2 0 / --fim-p1 0. (--fim-mode kept as alias.)")
+                   default='fisher', choices=['fisher'],
+                   help="FIM variant for partition='fisher'. Only 'fisher' (exact empirical Fisher) — "
+                        "the self-devised 'dplr' variant was removed 2026-07-13. Ignored when "
+                        "partition=magnitude. (The DPLR distillation loss builds its own FIM, independent.)")
     p.add_argument('--fim-p1', type=float, default=1.0,
                    help='Weight for rank-k (L2) component in DPLR (default 1.0)')
     p.add_argument('--fim-p2', type=float, default=1.0,
@@ -929,11 +930,11 @@ def main():
     p.add_argument('--resume', type=str, default='',
                    help='Path to last.pth checkpoint to resume from (model+opt+sched+scaler+epoch). '
                         'Use to recover after Kaggle session timeout. Mask is re-derived from '
-                        'the saved checkpoint, so --binary-ratio/--apb-scope must match the original run.')
+                        'the saved checkpoint, so --binary-ratio must match the original run.')
     p.add_argument('--init-model', type=str, default='',
                    help='Path to a WHOLE saved model object (torch.save(model), NOT a '
                         'state_dict) to quantize as-is — e.g. a pruned model from '
-                        'prune_swin_cifar.py (ckpt/pruned_cifar100/best_pruned_model.pt). '
+                        'prune_cifar.py (ckpt/pruned_cifar100/best_pruned_model.pt). '
                         'Its (possibly pruned) architecture is used directly; '
                         'timm.create_model + init_from_baseline are SKIPPED. The model '
                         "must already match --dataset's num_classes. This is how you "
@@ -972,7 +973,7 @@ def main():
         print(f'\n[{datetime.now():%Y-%m-%d %H:%M:%S}] ===== run start (log → {log_path}) =====')
 
     print(f'='*60)
-    print(f'APB QAT on Swin-S | device={device}')
+    print(f'APB QAT | model={args.model if not args.init_model else "(from --init-model)"} | device={device}')
     print(f'Args: {vars(args)}')
     print(f'='*60)
 
@@ -1009,13 +1010,13 @@ def main():
     # ----- Model -----
     if args.init_model:
         # Quantize a pre-built (e.g. pruned) model saved as a WHOLE object. Its
-        # architecture may differ from stock Swin-S (fewer heads / MLP neurons),
+        # architecture may differ from the stock model (fewer heads / MLP neurons),
         # so we load it directly instead of create_model + load_state_dict.
         print(f'Loading whole model object from {args.init_model} ...')
         model = torch.load(args.init_model, map_location=device, weights_only=False)
         if not isinstance(model, nn.Module):
             raise TypeError(f'--init-model must be a saved nn.Module (torch.save(model)), '
-                            f'got {type(model)}. For a state_dict, use ckpt/best.pth via '
+                            f'got {type(model)}. For a state_dict, use ckpt/best_swin.pth via '
                             f'init_from_baseline instead.')
         head = getattr(model, 'head', None)
         n_out = getattr(getattr(head, 'fc', head), 'out_features', None)
@@ -1025,14 +1026,16 @@ def main():
         print(f'>>> Quantizing pre-built model as-is (skipped create_model / '
               f'init_from_baseline){f", head out={n_out}" if n_out else ""}.')
     else:
-        print(f'Loading Swin-S pretrained (num_classes={num_classes}) ...')
-        model = timm.create_model('swin_small_patch4_window7_224', pretrained=True,
+        print(f'Loading {args.model} pretrained (num_classes={num_classes}) ...')
+        model = timm.create_model(args.model, pretrained=True,
                                   num_classes=num_classes)
-        status = init_from_baseline(model)
+        baseline_path = args.baseline_ckpt or None
+        status = init_from_baseline(model, baseline_path)
+        shown = baseline_path or DEFAULT_INIT_CKPT
         if status == 'loaded':
-            print(f'>>> Initialised from finetuned FP baseline: {DEFAULT_INIT_CKPT}')
+            print(f'>>> Initialised from finetuned FP baseline: {shown}')
         elif status == 'none':
-            print(f'>>> No {DEFAULT_INIT_CKPT} — using timm-pretrained weights.')
+            print(f'>>> No {shown} — using timm-pretrained weights.')
     model.to(device).eval()
 
     # FP baseline
@@ -1040,29 +1043,26 @@ def main():
     t1, t5, n = evaluate(model, val_loader, device, max_batches=max_b)
     print(f'[FP baseline]   top1={t1:.2f}% top5={t5:.2f}% ({n} samples)')
 
-    # ----- FIM extraction (needed for partition='fim' OR the DPLR distillation loss) -----
+    # ----- FIM extraction (needed for partition='fisher' OR the DPLR distillation loss) -----
     # DPLR loss builds its own per-block FIM inside DPLRBlockLoss.initialize() and does
-    # NOT consume this weight-FIM dict — so only partition='fim' actually needs it.
+    # NOT consume this weight-FIM dict — so only partition='fisher' actually needs it.
     # (Previously `or args.use_dplr_loss` triggered a FIM pass that was computed then
     # discarded — wasteful, and a FULL pass with --importance-full + magnitude.)
-    need_fim = (args.partition == 'fim')
+    need_fim = (args.partition == 'fisher')
     fim_dict = {}
     if need_fim:
         over = ('the FULL dataset' if args.importance_full
                 else f'{args.fim_batches} calib batches')
-        lr_tag = ' +LR' if args.logits_reversal else ''
-        print(f'Computing {args.importance.upper()}{lr_tag}-FIM(W) over {over} '
-              f"(p1={args.fim_p1}, p2={args.fim_p2}) [for partition='fim'] ...")
+        print(f'Computing {args.importance.upper()}-FIM(W) over {over} '
+              f"(p1={args.fim_p1}, p2={args.fim_p2}) [for partition='fisher'] ...")
         t0 = time.time()
         fim_dict = compute_weight_dplr_fim(model, calib_loader, device,
                                             n_batches=args.fim_batches,
                                             p1=args.fim_p1, p2=args.fim_p2,
                                             fim_mode=args.importance,
-                                            scope=args.apb_scope,
-                                            full=args.importance_full,
-                                            logits_reversal=args.logits_reversal)
-        print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers '
-              f'(scope={args.apb_scope})')
+                                            scope='full',
+                                            full=args.importance_full)
+        print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers (scope=full)')
     else:
         print(f"Skipping FIM extraction (partition={args.partition!r}).")
 
@@ -1072,9 +1072,9 @@ def main():
                            if (args.use_dplr_loss and args.init_model) else None)
 
     # ----- Apply APB -----
-    print(f'Applying APB (scope={args.apb_scope}, binary_ratio={args.binary_ratio}, '
+    print(f'Applying APB (scope=full, binary_ratio={args.binary_ratio}, '
           f'partition={args.partition}, act_bits={args.act_bits or "off"}) ...')
-    model = apply_apb(model, fim_dict, args.binary_ratio, device, scope=args.apb_scope,
+    model = apply_apb(model, fim_dict, args.binary_ratio, device, scope='full',
                       act_bits=args.act_bits, partition=args.partition)
     nl, rb, bits = avg_apb_stats(model)
     print(f'APB: {nl} layers wrapped | avg binary={rb:.3f} | avg eff_bits={bits:.2f}')
@@ -1097,14 +1097,14 @@ def main():
             # Pruned student: teacher = the pruned FP net itself (pre-APB snapshot).
             model_fp = fp_teacher_snapshot
         else:
-            model_fp = timm.create_model('swin_small_patch4_window7_224', pretrained=True,
+            model_fp = timm.create_model(args.model, pretrained=True,
                                          num_classes=num_classes)
-            init_from_baseline(model_fp)   # teacher must match the student's init
+            init_from_baseline(model_fp, args.baseline_ckpt or None)  # teacher matches student's init
         model_fp.to(device).eval()
         dplr = DPLRBlockLoss(model_fp, k=args.fim_batches,
                              p1=args.fim_p1, p2=args.fim_p2)
         dplr.initialize(model, calib_loader, device)
-        print(f'DPLR ready: {len(dplr.states)} Swin blocks tracked, '
+        print(f'DPLR ready: {len(dplr.states)} transformer blocks tracked, '
               f'λ={args.dplr_lambda}, p1={args.fim_p1}, p2={args.fim_p2}')
 
     # ----- QAT -----
@@ -1149,21 +1149,20 @@ def main():
           f'freeze α at epoch {freeze_at}, dplr={dplr is not None}, amp={use_amp}')
     print(f'='*60)
     for ep in range(start_epoch, args.epochs):
-        # Periodic mask refresh (FIM recompute only when partition='fim')
+        # Periodic mask refresh (FIM recompute only when partition='fisher')
         if (args.recompute_fim_every > 0 and ep > 0
                 and ep % args.recompute_fim_every == 0):
             t_fim = time.time()
             fim_new = {}
-            if args.partition == 'fim':
+            if args.partition == 'fisher':
                 fim_new = compute_weight_dplr_fim(model, calib_loader, device,
                                                   n_batches=args.fim_batches,
                                                   p1=args.fim_p1, p2=args.fim_p2,
                                                   fim_mode=args.importance,
-                                                  scope=args.apb_scope,
-                                                  full=args.importance_full,
-                                                  logits_reversal=args.logits_reversal)
+                                                  scope='full',
+                                                  full=args.importance_full)
             n_upd, flip_pct = update_masks_from_fim(model, fim_new, args.binary_ratio,
-                                                     scope=args.apb_scope,
+                                                     scope='full',
                                                      partition=args.partition)
             print(f'  >> Epoch {ep+1}: refreshed mask [{args.partition}] ({n_upd} layers, '
                   f'{flip_pct:.1f}% positions flipped) in {time.time()-t_fim:.1f}s')

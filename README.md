@@ -6,6 +6,10 @@ QAT end-to-end với CE loss + optional DPLR distillation loss.
 
 **Novelty:** FIM-based mask thay magnitude, áp lần đầu cho Vision Transformer.
 
+> ⛔ **DEPRECATED (2026-07-13):** `dplr`/`fim` cho **importance/partition** đã bỏ — chỉ dùng **`fisher`** (FIM
+> chuẩn) để rank. `dplr` (tự chế) chỉ còn trong **DPLR *loss*** (distillation), KHÔNG dùng ranking. README này
+> còn nhiều số/khái niệm cũ (Tiny ImageNet, dplr...) — tin `runs/README.md` + `ABLATIONS.md` + ``.
+
 ## Run
 
 ```bash
@@ -65,7 +69,7 @@ Backward: custom STE preserves cả `latent_weight` và `α` gradient.
 | `--fim-batches` | 5 | k calib batches cho importance (+ rank k của DPLR loss) |
 | `--importance-full` | False | tính importance trên **toàn dataset** (1 pass, exact; nên dùng với `fisher`) |
 | `--logits-reversal` | False | LR (arXiv 2603.18596): dùng CE(-logit) khi tính importance, fix gradient-vanishing; trực giao với `--importance` (`fisher`+LR = Ω^LR của paper) |
-| `--importance` | dplr | dplr / fisher (`--fim-mode` alias) |
+| `--importance` | fisher | ⛔ chỉ `fisher` (dplr đã bỏ; `--fim-mode` alias) |
 | `--use-dplr-loss` | False | DPLR distillation loss |
 | `--dplr-lambda` | 1.0 | Dùng **3000** (raw DPLR ~0.002 vs CE ~6) |
 | `--debug` | False | 2-epoch smoke test |

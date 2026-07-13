@@ -3,12 +3,20 @@
 Mỗi run lưu thành 1 file markdown gồm config + per-epoch metrics + observations.
 Đặt tên: `<date>_<model>_br<ratio>_<scope>_<extra>.md`.
 
+> ⛔ **DEPRECATED (2026-07-13):** `dplr`/`fim` cho **IMPORTANCE & PARTITION** đã bỏ (bản tự chế, không rigorous
+> để rank) → chỉ dùng **`fisher`** để rank. **DPLR *loss* (distillation) GIỮ NGUYÊN.** Trong các bảng dưới:
+> mọi hàng/cột `dplr`-importance và `fim`-partition (thực chất = dplr) là **deprecated làm bằng chứng** — chỉ
+> tham khảo/appendix. **Partition đổi tên `fim` → `fisher`** (2026-07-13); A2 (fisher vs magnitude) **đã có** (Kaggle): **magnitude > fisher** — xem `2026-07-03_..._A2_fisher_partition_br0.99_act2.md` + `../ABLATIONS.md`.
+> ⚠️ Lưu ý: `dplr3000` / `dplr-lambda` / `use-dplr-loss` trong tên file & config = **DPLR *loss*** (giữ nguyên),
+> KHÔNG phải dplr-importance.
+
 ---
 
 # Structural pruning (Swin-S / CIFAR-100) — nhánh `feat/structural-pruning`
 
 Khác hẳn nhóm APB QAT (C1–C8 bên dưới): đây là **structural pruning** (bỏ head/MLP channel theo
-DPLR-FIM importance, lowest-FIM dropped), KHÔNG quantize. Script `apb_fimaq/prune_swin_cifar.py`.
+DPLR-FIM importance, lowest-FIM dropped), KHÔNG quantize. Script `apb_fimaq/prune_cifar.py`
+(tên cũ `prune_swin_cifar.py`, đổi 2026-07-12 khi hỗ trợ đa kiến trúc).
 Init từ CIFAR baseline `ckpt/best.pth` → **FP baseline = 90.88%** (mốc so prune cost).
 Chung: CIFAR-100, fim_batches=10, lr=1e-4, bs=64, AMP, seed=3407, wd=1e-4, label_smoothing=0.1.
 
@@ -48,7 +56,7 @@ nhiều ở block "rẻ"). Khoảng cách rõ nhất ở ratio cao (0.9: +2.36%)
 - Post-prune (trước finetune) tụt mạnh hơn khi ratio cao & per_layer (P2 7.01% < P1 19.08%) nhưng
   finetune san bằng phần lớn ở ratio ≤0.7.
 
-## ⭐ Ablation IMPORTANCE cho pruning (dplr / fisher / magnitude) — global, seed 3407
+## ⭐ Ablation IMPORTANCE cho pruning (fisher / magnitude; ⛔ dplr deprecated) — global, seed 3407
 
 So các importance metric ở CÙNG config global (`--global-metric per_param --mlp-keep-frac 0.05`),
 đổi head/mlp ratio 0.5/0.7/0.9. Mỗi ô = **best top-1 % (params M)** sau finetune. FP baseline 90.88%.
@@ -56,14 +64,14 @@ So các importance metric ở CÙNG config global (`--global-metric per_param --
 
 | importance         | 0.5              | 0.7              | 0.9              |
 | ------------------ | ---------------- | ---------------- | ---------------- |
-| **dplr**           | **90.87** (23.1) | **87.80** (14.3) | 63.00 (6.0)      |
-| **fisher**         | 90.39 (22.1)     | 87.50 (13.6)     | 71.07 (5.7)      |
+| **fisher ⭐ (chốt)** | 90.39 (22.1)     | 87.50 (13.6)     | 71.07 (5.7)      |
+| ~~dplr~~ ⛔ deprecated | ~~90.87 (23.1)~~ | ~~87.80 (14.3)~~ | ~~63.00 (6.0)~~  |
 | **fisher+LR+full** | 90.40 (23.4)     | 87.47 (14.2)     | **72.26** (5.7)  |
 | magnitude l2sq     | 88.33 (25.8)     | 79.01 (15.8)     | 53.08 (5.9)      |
 | magnitude l1       | 87.60 (26.1)     | 76.71 (16.0)     | 51.31 (5.9)      |
 
 **Kết luận (nguồn: `image.png`):**
-1. **⭐ FIM (dplr/fisher) THẮNG magnitude ở MỌI ratio** — NGƯỢC với ablation partition của QAT (magnitude
+1. **⭐ fisher (FIM chuẩn) THẮNG magnitude ở MỌI ratio** (⛔ dplr đã bỏ khỏi importance) — NGƯỢC với ablation partition của QAT (magnitude
    thắng fim 9/9 ô). ⇒ FIMA-Q importance **có giá trị cho structural pruning** (dù không cho partition).
    Trả lời TODO "chứng minh giá trị FIMA-Q importance": ✅ đã chứng minh (cho pruning).
 2. **dplr ≈ fisher ở 0.5/0.7** (dplr acc nhỉnh +0.3%, fisher ít params hơn ~1M) → Pareto xấp xỉ ngang.

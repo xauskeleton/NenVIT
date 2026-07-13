@@ -1,5 +1,7 @@
 # Swin-S APB W+A — CIFAR-100 (C8+A1 **FIM / no-DPLR** / full / br0.99 / act 1-bit)
 
+> ⛔ **DEPRECATED partition (2026-07-13):** `--partition fim` ở đây = **dplr** (bản tự chế) → số partition KHÔNG dùng làm bằng chứng nữa; đại diện FIM đúng = `fisher` (`--partition fisher`) — A2 đã có (Kaggle): **magnitude > fisher** (xem `2026-07-03_..._A2_fisher_partition...` + `../ABLATIONS.md`).
+
 Run date: 2026-06-28 (~7.5h) | Script: `apb_fimaq/qat.py` | `--partition fim`, KHÔNG `--use-dplr-loss`
 Cell cuối của ma trận 2×2 (partition × DPLR). FIM chỉ dùng cho **partition**, không có distillation loss.
 

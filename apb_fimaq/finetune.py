@@ -1,5 +1,5 @@
 """
-Plain FP fine-tuning of Swin-S — no APB / FIM / DPLR.
+Plain FP fine-tuning of Swin / ViT (DeiT) — no APB / FIM / DPLR. Model via --model.
 
 Produces a clean full-precision baseline (best.pth = raw model.state_dict()).
 Shares data loaders, eval and log-tee with qat.py so numbers are directly
@@ -74,6 +74,10 @@ def main():
                         'tiny/imagenet1k as in qat.py.')
     p.add_argument('--data-dir', type=str, default='',
                    help='Root dir. Required for imagenet1k; download dir for cifar*.')
+    p.add_argument('--model', type=str, default=MODEL,
+                   help=f'timm model to fine-tune (default {MODEL}). Use e.g. '
+                        'deit_small_patch16_224 to build a per-arch FP baseline, then '
+                        'point prune/qat at it via --baseline-ckpt <out-dir>/best.pth.')
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--patience', type=int, default=5,
                    help='Early stopping: stop if val top1 does not improve by '
@@ -119,14 +123,14 @@ def main():
               f'(log → {log_path}) =====')
 
     print('=' * 60)
-    print(f'FP fine-tune Swin-S | device={device}')
+    print(f'FP fine-tune {args.model} | device={device}')
     print(f'Args: {vars(args)}')
     print('=' * 60)
 
     train_loader, val_loader, num_classes = build_data(args)
 
-    print(f'Loading Swin-S pretrained (num_classes={num_classes}) ...')
-    model = timm.create_model(MODEL, pretrained=True, num_classes=num_classes)
+    print(f'Loading {args.model} pretrained (num_classes={num_classes}) ...')
+    model = timm.create_model(args.model, pretrained=True, num_classes=num_classes)
     model.to(device)
 
     if args.freeze_backbone:

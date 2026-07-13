@@ -1,5 +1,7 @@
 # Swin-S APB W+A — CIFAR-100 (br0.95 / full / act 2-bit / **fim / no-DPLR**)
 
+> ⛔ **DEPRECATED partition (2026-07-13):** `--partition fim` ở đây = **dplr** (bản tự chế) → số partition KHÔNG dùng làm bằng chứng nữa; đại diện FIM đúng = `fisher` (`--partition fisher`) — A2 đã có (Kaggle): **magnitude > fisher** (xem `2026-07-03_..._A2_fisher_partition...` + `../ABLATIONS.md`).
+
 Run date: 2026-06-30 (~9.8h) | Script: `apb_fimaq/qat.py` | `--partition fim --act-bits 2` (no `--use-dplr-loss`)
 Init-baseline (FP 90.88%). Đây là 1 trong bộ **br0.95 + act2** (TODO quan trọng README) để kiểm tra
 "magnitude > fim có co lại khi bớt cực hạn br0.99→0.95 không". Ô sạch fim/no-DPLR.

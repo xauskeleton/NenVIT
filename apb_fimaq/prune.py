@@ -1,5 +1,5 @@
 """
-Structural pruning for Swin Transformer, guided by FIMA-Q (DPLR-FIM) importance.
+Structural pruning for Swin / ViT (DeiT) Transformers, guided by FIMA-Q (DPLR-FIM) importance.
 
 Two structured granularities — both chosen because they DO NOT change a block's
 input/output channel dim (stage dim), so no shape change propagates across blocks,
@@ -24,7 +24,14 @@ import math
 import torch
 from torch import nn
 import timm.models.swin_transformer as _swin
+import timm.models.vision_transformer as _vit
 from timm.layers import Mlp
+
+# Attention modules we can structurally prune. All share the same qkv (3*dim, dim) /
+# proj (dim, dim) / num_heads layout, so head selection + cutting is identical.
+# Swin's WindowAttention additionally owns a relative_position_bias_table (num_heads
+# columns) that plain ViT/DeiT Attention does not — handled conditionally in the cut.
+ATTN_TYPES = (_swin.WindowAttention, _vit.Attention)
 
 
 # ------------------------------------------------------------------ importance
@@ -32,7 +39,7 @@ def head_importance_from_fim(model, fim_dict):
     """Return {attn_module_name: Tensor[num_heads]} of FIM importance per head."""
     out = {}
     for name, mod in model.named_modules():
-        if not isinstance(mod, _swin.WindowAttention):
+        if not isinstance(mod, ATTN_TYPES):
             continue
         H = mod.num_heads
         dim = mod.qkv.in_features
@@ -82,7 +89,7 @@ def head_importance_from_magnitude(model, norm='l2sq'):
     norm='l1' → Σ|w| (matches APB's |w| magnitude convention)."""
     out = {}
     for name, mod in model.named_modules():
-        if not isinstance(mod, _swin.WindowAttention):
+        if not isinstance(mod, ATTN_TYPES):
             continue
         H = mod.num_heads
         dim = mod.qkv.in_features
@@ -143,9 +150,16 @@ def prune_heads_in_attn(attn, keep):
         new_proj.bias.data.copy_(attn.proj.bias.data)
     attn.proj = new_proj
 
-    attn.relative_position_bias_table = nn.Parameter(
-        attn.relative_position_bias_table.data[:, keep].clone())
+    # Swin owns a per-head relative_position_bias_table (n_rel, num_heads); plain
+    # ViT/DeiT attention has none. Only slice it when present.
+    if getattr(attn, 'relative_position_bias_table', None) is not None:
+        attn.relative_position_bias_table = nn.Parameter(
+            attn.relative_position_bias_table.data[:, keep].clone())
     attn.num_heads = Hn
+    # timm's ViT/DeiT Attention caches attn_dim = num_heads*head_dim and uses it in the
+    # output reshape; keep it in sync after dropping heads (Swin WindowAttention lacks it).
+    if hasattr(attn, 'attn_dim'):
+        attn.attn_dim = Hn * hd
 
 
 @torch.no_grad()
@@ -226,7 +240,7 @@ def _global_keep(imp_dict, cost_dict, ratio, floor_dict, metric):
 
 
 # ------------------------------------------------------------------ driver
-def prune_swin(model, fim_dict, head_ratio=0.25, mlp_ratio=0.25, min_heads=1,
+def prune_transformer(model, fim_dict, head_ratio=0.25, mlp_ratio=0.25, min_heads=1,
                rank_mode='per_layer', global_metric='per_param',
                head_keep_frac=0.0, mlp_keep_frac=0.05,
                importance='fim', mag_norm='l2sq'):
@@ -254,7 +268,7 @@ def prune_swin(model, fim_dict, head_ratio=0.25, mlp_ratio=0.25, min_heads=1,
         head_imp = head_importance_from_fim(model, fim_dict)
         neuron_imp = neuron_importance_from_fim(model, fim_dict)
     attns = {n: m for n, m in model.named_modules()
-             if isinstance(m, _swin.WindowAttention)}
+             if isinstance(m, ATTN_TYPES)}
     mlps = {n: m for n, m in model.named_modules() if isinstance(m, Mlp)}
     p0 = sum(p.numel() for p in model.parameters())
 
@@ -292,33 +306,34 @@ def prune_swin(model, fim_dict, head_ratio=0.25, mlp_ratio=0.25, min_heads=1,
     }
 
 
+# Backward-compat alias: prune_transformer used to be Swin-only and named prune_swin.
+prune_swin = prune_transformer
+
+
 # ------------------------------------------------------------------ self-test
 if __name__ == '__main__':
     import timm
     from qat import get_target_layers
 
-    def heads_per_stage(model):
-        from collections import OrderedDict
-        d = OrderedDict()
-        for n, mod in model.named_modules():
-            if isinstance(mod, _swin.WindowAttention):
-                stage = n.split('.')[1]            # layers.<stage>.blocks...
-                d[stage] = d.get(stage, 0) + mod.num_heads
-        return dict(d)
+    def total_heads(model):
+        return sum(mod.num_heads for _, mod in model.named_modules()
+                   if isinstance(mod, ATTN_TYPES))
 
     x = torch.randn(2, 3, 224, 224)
-    for mode in ('per_layer', 'global'):
-        torch.manual_seed(0)
-        m = timm.create_model('swin_small_patch4_window7_224', num_classes=100).eval()
-        fake_fim = {n: torch.rand_like(mod.weight)
-                    for n, mod in get_target_layers(m, scope='skip').items()}
-        stats = prune_swin(m, fake_fim, head_ratio=0.25, mlp_ratio=0.25,
-                           rank_mode=mode, global_metric='per_param')
-        with torch.no_grad():
-            y = m(x)
-        assert y.shape == (2, 100) and torch.isfinite(y).all()
-        print(f'[{mode:9s}] forward OK | heads {stats["heads_before"]}->'
-              f'{stats["heads_after"]} | mlp {stats["mlp_neurons_before"]}->'
-              f'{stats["mlp_neurons_after"]} | params '
-              f'{stats["params_after"]/1e6:.2f}M ({stats["param_reduction"]:.1%} smaller) '
-              f'| heads/stage {heads_per_stage(m)}')
+    # Swin (hierarchical, WindowAttention + rel_pos_bias) AND DeiT (isotropic ViT,
+    # plain Attention, no rel_pos_bias) — both must prune + forward cleanly.
+    for model_name in ('swin_small_patch4_window7_224', 'deit_small_patch16_224'):
+        for mode in ('per_layer', 'global'):
+            torch.manual_seed(0)
+            m = timm.create_model(model_name, num_classes=100).eval()
+            fake_fim = {n: torch.rand_like(mod.weight)
+                        for n, mod in get_target_layers(m, scope='skip').items()}
+            stats = prune_transformer(m, fake_fim, head_ratio=0.25, mlp_ratio=0.25,
+                               rank_mode=mode, global_metric='per_param')
+            with torch.no_grad():
+                y = m(x)
+            assert y.shape == (2, 100) and torch.isfinite(y).all()
+            print(f'[{model_name.split("_")[0]:5s} {mode:9s}] forward OK | heads '
+                  f'{stats["heads_before"]}->{stats["heads_after"]} | mlp '
+                  f'{stats["mlp_neurons_before"]}->{stats["mlp_neurons_after"]} | params '
+                  f'{stats["params_after"]/1e6:.2f}M ({stats["param_reduction"]:.1%} smaller)')

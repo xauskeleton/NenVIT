@@ -23,7 +23,7 @@ from qat import (
 
 
 def build_tiny_model():
-    """Stack of 4 Linears approximating a Swin block (qkv, proj, fc1, fc2)."""
+    """Stack of 4 Linears approximating a transformer block (qkv, proj, fc1, fc2)."""
     C = 384
     return nn.Sequential(
         nn.Linear(C, 3 * C),     # qkv
