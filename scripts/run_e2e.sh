@@ -41,6 +41,7 @@ FT_EPOCHS="${FT_EPOCHS:-20}"
 PRUNE_EPOCHS="${PRUNE_EPOCHS:-20}"
 QAT_EPOCHS="${QAT_EPOCHS:-30}"   # chuẩn hóa 30 (khớp C5-C8; số cũ 29 chỉ ở vài run combined)
 BATCH="${BATCH:-32}"
+PATIENCE="${PATIENCE:-5}"   # early-stop patience cho CẢ 3 stage (0=tắt). QAT: best hay ở epoch cuối nên cân nhắc.
 
 # out-dir suy từ tên họ model: ckpt_swin / ckpt_deit / ckpt_vit ...
 OUT="${OUT:-ckpt_${MODEL%%_*}}"
@@ -69,7 +70,7 @@ if [ -z "$BASELINE" ]; then
   else
     echo ">> Stage 1: finetune FP baseline -> $OUT/ft/best.pth"
     "$PY" apb_fimaq/finetune.py --model "$MODEL" --dataset "$DATASET" \
-      --epochs "$FT_EPOCHS" --batch-size "$BATCH" --seed "$SEED" \
+      --epochs "$FT_EPOCHS" --batch-size "$BATCH" --seed "$SEED" --patience "$PATIENCE" \
       --out-dir "$OUT/ft" $DBG
     BASELINE="$OUT/ft/best.pth"
   fi
@@ -85,7 +86,7 @@ else
     --baseline-ckpt "$BASELINE" \
     --importance fisher --rank-mode "$RANK_MODE" --global-metric per_param \
     --head-ratio "$HEAD_RATIO" --mlp-ratio "$MLP_RATIO" --mlp-keep-frac "$MLP_KEEP_FRAC" \
-    --epochs "$PRUNE_EPOCHS" --batch-size "$BATCH" --seed "$SEED" \
+    --epochs "$PRUNE_EPOCHS" --batch-size "$BATCH" --seed "$SEED" --patience "$PATIENCE" \
     --out-dir "$OUT/pruned" $DBG
 fi
 
@@ -95,7 +96,7 @@ echo ">> Stage 3: APB-QAT (magnitude+DPLR) -> $OUT/prune_quant/best.pth"
   --init-model "$PRUNED" \
   --partition magnitude --binary-ratio "$BR" --act-bits "$ACT_BITS" \
   --use-dplr-loss --dplr-lambda "$DPLR_LAMBDA" \
-  --epochs "$QAT_EPOCHS" --batch-size "$BATCH" --seed "$SEED" \
+  --epochs "$QAT_EPOCHS" --batch-size "$BATCH" --seed "$SEED" --patience "$PATIENCE" \
   --out-dir "$OUT/prune_quant" $DBG
 
 echo "=============================================================="
