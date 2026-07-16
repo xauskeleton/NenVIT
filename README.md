@@ -8,7 +8,7 @@ QAT end-to-end với CE loss + optional DPLR distillation loss.
 
 > ⛔ **DEPRECATED (2026-07-13):** `dplr`/`fim` cho **importance/partition** đã bỏ — chỉ dùng **`fisher`** (FIM
 > chuẩn) để rank. `dplr` (tự chế) chỉ còn trong **DPLR *loss*** (distillation), KHÔNG dùng ranking. README này
-> còn nhiều số/khái niệm cũ (Tiny ImageNet, dplr...) — tin `runs/README.md` + `ABLATIONS.md` + ``.
+> còn nhiều số/khái niệm cũ (Tiny ImageNet, dplr...) — tin `runs/README.md` + `ABLATIONS.md`.
 
 ## Run
 

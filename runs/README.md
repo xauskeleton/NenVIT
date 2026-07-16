@@ -92,6 +92,32 @@ quantize (prune+quant). Re-run bản khác PHẢI truyền `--out-dir` riêng.
 
 ---
 
+# ⭐ Multi-arch prune→quant end-to-end (Swin / DeiT / ViT) — CIFAR-100
+
+Pipeline đầy đủ 1 lệnh `scripts/run_e2e.sh`: **FP baseline → prune (fisher, global 0.5) → APB-QAT
+(partition magnitude + DPLR λ=3000)**. Sweep `br ∈ {0.95, 0.99} × act ∈ {1, 2}` cho cả 3 model.
+Chạy trên GPU (2026-07-16). Số = **best val top-1** (`train.log`).
+
+| model  | br0.95 / act1 | br0.95 / act2 | br0.99 / act1 | br0.99 / act2 |
+| ------ | ------------- | ------------- | ------------- | ------------- |
+| **Swin** | 57.63% | **83.25%** | 52.47% | 81.23% |
+| **DeiT** | 51.00% | 76.22% | 48.57% | 73.69% |
+| **ViT**  | 48.91% | 73.76% | 47.40% | 69.03% |
+
+**Nhận xét:**
+1. **Thứ hạng kiến trúc nhất quán 12/12 ô: Swin > DeiT > ViT.** Swin (windowed attn + hierarchical) chịu
+   prune+quant tốt nhất; ViT thuần kém nhất mọi cấu hình.
+2. **act2 ≫ act1 (vách đá 1-bit) ở mọi model** — khớp ablation Swin cũ (C8+A2 vs C8+A1). Gap A1→A2:
+   Swin +25.6/+28.8, DeiT +25.2/+25.1, ViT +24.9/+21.6 điểm.
+3. **br0.95 > br0.99 mọi ô** (giữ nhiều FP weight hơn → acc cao hơn, đánh đổi nén). Chênh nhỏ hơn nhiều
+   so với chênh act-bit → act-bit là yếu tố chi phối accuracy, không phải binary-ratio.
+4. **Cấu hình tốt nhất mỗi model = br0.95 + act2:** Swin 83.25%, DeiT 76.22%, ViT 73.76%.
+
+⚠️ Single-seed (3407), pipeline prune 0.5 + magnitude+DPLR (không sweep partition/ratio ở đây). Chưa có
+FP baseline riêng từng model để tính quant cost fair — TODO. Log gốc: `ckpt_{swin,deit,vit}/prune_quant_br<BR>_act<AB>/train.log`.
+
+---
+
 # APB QAT (Swin-S / Tiny ImageNet → CIFAR-100)
 
 ## Pareto so sánh các run

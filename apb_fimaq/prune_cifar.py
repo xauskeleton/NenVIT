@@ -158,6 +158,7 @@ def main():
     model.to(device)
 
     t1, t5, n = evaluate(model, val_loader, device, max_batches=max_b)
+    fp_top1 = t1          # giữ FP baseline THẬT của model này (in prune cost đúng, mọi kiến trúc)
     print(f'[FP baseline]   top1={t1:.2f}% top5={t5:.2f}% ({n} samples)')
 
     # ----- importance: data-free 'magnitude' OR calib-based 'dplr'/'fisher' -----
@@ -252,8 +253,7 @@ def main():
     print('=' * 60)
     print(f'DONE. Best pruned val top1 = {best_top1:.2f}% '
           f'| params {stats["params_after"]/1e6:.2f}M ({stats["param_reduction"]:.1%} smaller)')
-    print(f'FP baseline was {90.88 if args.dataset=="cifar100" else "?"}% '
-          f'-> prune cost = {(90.88-best_top1):.2f}%' if args.dataset == 'cifar100' else '')
+    print(f'FP baseline was {fp_top1:.2f}% -> prune cost = {fp_top1-best_top1:.2f}%')
     print('=' * 60)
 
 

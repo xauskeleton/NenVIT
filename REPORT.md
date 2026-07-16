@@ -273,7 +273,6 @@ tốn −0.60% acc khi chồng lên quant (81.19% vs 81.79%), cấu hình tốt 
 - `apb_fimaq/prune.py` + `prune_cifar.py` — structural pruning + finetune.
 - `apb_fimaq/finetune.py` — FP baseline. `apb_fimaq/fimaq_ptq_cifar.py` — PTQ baseline (dùng FIMA-Q/ gốc, chỉ import).
 - `scripts/cifar_loader.py` — dataloader. `runs/*.md` + `runs/README.md` — log + bảng kết quả đầy đủ.
-- Xem `` để biết lệnh chạy, default, và quy ước.
 
 ## 10. Tài liệu tham khảo
 1. Nardini et al., *Neural Network Compression using Binarization and Few Full-Precision Weights (APB)*, arXiv:2306.08960.

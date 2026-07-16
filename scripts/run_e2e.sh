@@ -37,11 +37,16 @@ BR="${BR:-0.95}"
 ACT_BITS="${ACT_BITS:-2}"
 DPLR_LAMBDA="${DPLR_LAMBDA:-3000}"
 # training
-FT_EPOCHS="${FT_EPOCHS:-20}"
-PRUNE_EPOCHS="${PRUNE_EPOCHS:-20}"
-QAT_EPOCHS="${QAT_EPOCHS:-30}"   # chuẩn hóa 30 (khớp C5-C8; số cũ 29 chỉ ở vài run combined)
+FT_EPOCHS="${FT_EPOCHS:-50}"
+PRUNE_EPOCHS="${PRUNE_EPOCHS:-50}"
+QAT_EPOCHS="${QAT_EPOCHS:-50}"   # epoch cao để cosine LR (T_max=epochs) anneal hết về ~0 ở cuối
 BATCH="${BATCH:-32}"
-PATIENCE="${PATIENCE:-5}"   # early-stop patience cho CẢ 3 stage (0=tắt). QAT: best hay ở epoch cuối nên cân nhắc.
+PATIENCE="${PATIENCE:-15}"  # early-stop patience cho CẢ 3 stage — CAO, ghép với epoch cao (50).
+                            # Lý do: cosine LR (T_max=epochs) chỉ anneal ~0 ở epoch cuối. patience=5 cũ
+                            # cắt quá sớm khi LR còn cao → prune cost phồng (Swin ep12/50 LR86% cost2.06%;
+                            # ViT ep17/50 cost4.10%; DeiT ep21/50 cost2.22%). patience=15 + 50ep: nửa sau
+                            # cosine hạ LR → val bò lên tạo best mới → reset counter → tự chạy gần hết,
+                            # early-stop chỉ cắt run thật sự chết. Muốn tuyệt đối chắc: PATIENCE=0.
 
 # out-dir suy từ tên họ model: ckpt_swin / ckpt_deit / ckpt_vit ...
 OUT="${OUT:-ckpt_${MODEL%%_*}}"

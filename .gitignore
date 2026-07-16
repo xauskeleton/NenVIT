@@ -74,3 +74,6 @@ runs_test/
 
 # wandb local runs
 wandb/
+
+# checkpoint archives
+*.tar.gz
