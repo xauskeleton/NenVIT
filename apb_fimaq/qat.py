@@ -312,26 +312,9 @@ SKIP_PATTERNS_SKIP = ('downsample.reduction', 'head', 'patch_embed')  # default:
 SKIP_PATTERNS_FULL = ('patch_embed',)                                  # full: only skip Conv2d
 
 
-def get_target_layers(model: nn.Module, scope: str = 'skip') -> dict:
-    """
-    Return {name: module} of APB targets. Works for both pre-wrap (nn.Linear)
-    and post-wrap (APBLinear) states.
-
-    scope='skip' (default): 96 Linears — qkv/proj/fc1/fc2 × 24 blocks.
-        Skips head.fc, 3 downsample.reduction, patch_embed (Conv2d anyway).
-        Safe: doesn't touch classifier output or cross-resolution merge.
-
-    scope='full': 100 Linears — adds head.fc + 3 downsample.reduction to APB.
-        Aggressive: maximize compression coverage but risk accuracy drop.
-        patch_embed.proj (Conv2d) still skipped since APBLinear only wraps nn.Linear.
-    """
-    if scope == 'skip':
-        skip_patterns = SKIP_PATTERNS_SKIP
-    elif scope == 'full':
-        skip_patterns = SKIP_PATTERNS_FULL
-    else:
-        raise ValueError(f'scope must be "skip" or "full", got {scope!r}')
-
+def _linear_targets(model: nn.Module, skip_patterns) -> dict:
+    """{name: module} of the nn.Linear (or already-wrapped APBLinear) matching
+    the given skip list. Use get_apb_layers / get_prunable_layers, not this."""
     targets = {}
     for n, m in model.named_modules():
         if isinstance(m, APBLinear):
@@ -344,9 +327,24 @@ def get_target_layers(model: nn.Module, scope: str = 'skip') -> dict:
 # ============================================================
 # FIM EXTRACTION — DPLR (Diagonal + Low-Rank), per FIMA-Q Eq (20-21)
 # ============================================================
-def compute_weight_dplr_fim(model, calib_loader, device,
+def get_apb_layers(model: nn.Module) -> dict:
+    """Every nn.Linear — per-block qkv/proj/fc1/fc2 plus head.fc and
+    downsample.reduction. This is what APB quantizes. patch_embed.proj stays out:
+    it is a Conv2d and APBLinear only wraps Linear. Swin-S: 100 layers."""
+    return _linear_targets(model, SKIP_PATTERNS_FULL)
+
+
+def get_prunable_layers(model: nn.Module) -> dict:
+    """Only the per-block Linears — what structural pruning ranks over, because
+    attention heads and MLP neurons live inside blocks. head.fc is the classifier
+    and downsample.reduction merges resolutions; neither has anything to cut, and
+    including them would skew the global ranking. Swin-S: 96 layers."""
+    return _linear_targets(model, SKIP_PATTERNS_SKIP)
+
+
+def compute_weight_dplr_fim(model, calib_loader, device, targets,
                              n_batches=5, p1=1.0, p2=1.0, fim_mode='dplr',
-                             scope='skip', full=False):
+                             full=False):
     """
     Compute DPLR-FIM-based importance for each target Linear's weights.
 
@@ -378,7 +376,6 @@ def compute_weight_dplr_fim(model, calib_loader, device,
     Returns:
       dict {name: F_DPLR(W) tensor of shape (out, in)}
     """
-    targets = get_target_layers(model, scope=scope)
     fisher = (fim_mode == 'fisher')
     # Accumulators
     x_sq  = {n: 0.0 for n in targets}   # E[x²] per input channel
@@ -480,12 +477,12 @@ def _partition_score(weight, fim, partition):
     raise ValueError(f'partition must be fisher|magnitude, got {partition!r}')
 
 
-def apply_apb(model, fim_dict, binary_ratio, device, scope='skip', act_bits=0,
+def apply_apb(model, fim_dict, binary_ratio, device, act_bits=0,
               partition='magnitude'):
     """Wrap each target Linear with APBLinear using a `partition`-percentile mask.
     partition: 'fisher' (FIM-guided) or 'magnitude' (pure APB, default).
     act_bits: LSQ activation bit-width on each wrapped layer's input (0/32 = off)."""
-    targets = get_target_layers(model, scope=scope)
+    targets = get_apb_layers(model)
     for name, mod in targets.items():
         if isinstance(mod, APBLinear):
             continue  # already wrapped
@@ -503,13 +500,13 @@ def apply_apb(model, fim_dict, binary_ratio, device, scope='skip', act_bits=0,
     return model
 
 
-def update_masks_from_fim(model, fim_dict, binary_ratio, scope='skip', partition='magnitude'):
+def update_masks_from_fim(model, fim_dict, binary_ratio, partition='magnitude'):
     """Refresh masks of APBLinear layers in-place using the chosen `partition` score.
     Keeps latent_weight, α, and structure intact — only mask buffer changes."""
     n_updated = 0
     n_flipped_total = 0
     n_weights_total = 0
-    for name, mod in get_target_layers(model, scope=scope).items():
+    for name, mod in get_apb_layers(model).items():
         if not isinstance(mod, APBLinear):
             continue
         if partition == 'fisher' and name not in fim_dict:
@@ -813,7 +810,7 @@ def pack_apb_state_dict(model, fp_dtype='fp32'):
           fp_values:    fp_dtype array (s entries) — FP values at those positions.
           alpha:        scalar.
 
-        Non-APB params (LN, biases of non-APB layers, head if scope=skip) saved as fp_dtype.
+        Non-APB params (LayerNorm, biases of non-APB layers) saved as fp_dtype.
 
     Total bits = (n-s) + s·(b_v + b_p) + 32  per layer  (paper Eq 10).
     Position list (paper's choice) is more compact than bitmap mask when p < ~0.96.
@@ -900,7 +897,7 @@ def actual_effective_bits(packed: dict, file_bytes: int) -> dict:
                        are stored as int32 (32 bit) instead of b_p≈20 bit.
       - whole_bpw    : full file size × 8 ÷ ALL model weights (APB + _other).
                        This is the honest "how many bits/weight did we ship"
-                       (APB scope is always full: head.fc + downsample.reduction are
+                       (APB covers every Linear: head.fc + downsample.reduction are
                        quantized too, only LN/biases remain fp32 in _other).
     """
     def _nbytes(t):
@@ -1165,11 +1162,11 @@ def main():
         print(f"Computing FISHER-FIM(W) over {over} [for partition='fisher'] ...")
         t0 = time.time()
         fim_dict = compute_weight_dplr_fim(model, calib_loader, device,
+                                            get_apb_layers(model),
                                             n_batches=args.fim_batches,
                                             fim_mode='fisher',
-                                            scope='full',
                                             full=args.importance_full)
-        print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers (scope=full)')
+        print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers')
     else:
         print(f"Skipping FIM extraction (partition={args.partition!r}).")
 
@@ -1179,9 +1176,9 @@ def main():
                            if (args.use_dplr_loss and args.init_model) else None)
 
     # ----- Apply APB -----
-    print(f'Applying APB (scope=full, binary_ratio={args.binary_ratio}, '
+    print(f'Applying APB (binary_ratio={args.binary_ratio}, '
           f'partition={args.partition}, act_bits={args.act_bits or "off"}) ...')
-    model = apply_apb(model, fim_dict, args.binary_ratio, device, scope='full',
+    model = apply_apb(model, fim_dict, args.binary_ratio, device,
                       act_bits=args.act_bits, partition=args.partition)
     nl, rb, bits = avg_apb_stats(model)
     print(f'APB: {nl} layers wrapped | avg binary={rb:.3f} | avg eff_bits={bits:.2f}')
@@ -1281,12 +1278,11 @@ def main():
             fim_new = {}
             if args.partition == 'fisher':
                 fim_new = compute_weight_dplr_fim(model, calib_loader, device,
+                                                  get_apb_layers(model),
                                                   n_batches=args.fim_batches,
                                                   fim_mode='fisher',
-                                                  scope='full',
                                                   full=args.importance_full)
             n_upd, flip_pct = update_masks_from_fim(model, fim_new, args.binary_ratio,
-                                                     scope='full',
                                                      partition=args.partition)
             print(f'  >> Epoch {ep+1}: refreshed mask [{args.partition}] ({n_upd} layers, '
                   f'{flip_pct:.1f}% positions flipped) in {time.time()-t_fim:.1f}s')
@@ -1409,7 +1405,7 @@ def main():
         print(f'  >> Effective bit (WHOLE model): {act["whole_bpw"]:.2f} bits/weight '
               f'over {act["total_weights"]/1e6:.1f}M params')
         print(f'  Actual file: best_packed.pt = {packed_bytes/1e6:.1f} MB '
-              f'(incl. non-APB params fp32: LN, biases, head/downsample if scope=skip)')
+              f'(incl. non-APB params fp32: LN, biases, patch_embed)')
         print(f'  best.pth (training FP32): {fp32_bytes/1e6:.1f} MB '
               f'| Compression: {fp32_bytes/max(packed_bytes,1):.1f}×')
         print(f'  (paper-compare only — Eq10 theoretical, APB layers: '

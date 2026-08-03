@@ -313,7 +313,7 @@ prune_swin = prune_transformer
 # ------------------------------------------------------------------ self-test
 if __name__ == '__main__':
     import timm
-    from qat import get_target_layers
+    from qat import get_prunable_layers
 
     def total_heads(model):
         return sum(mod.num_heads for _, mod in model.named_modules()
@@ -327,7 +327,7 @@ if __name__ == '__main__':
             torch.manual_seed(0)
             m = timm.create_model(model_name, num_classes=100).eval()
             fake_fim = {n: torch.rand_like(mod.weight)
-                        for n, mod in get_target_layers(m, scope='skip').items()}
+                        for n, mod in get_prunable_layers(m).items()}
             stats = prune_transformer(m, fake_fim, head_ratio=0.25, mlp_ratio=0.25,
                                rank_mode=mode, global_metric='per_param')
             with torch.no_grad():

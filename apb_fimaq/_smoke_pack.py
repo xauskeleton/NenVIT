@@ -47,7 +47,7 @@ def get_targets(model):
 
 
 def apply_apb_simple(model, fim_dict, binary_ratio, device='cpu'):
-    """Local copy of apply_apb without scope filter (we only have Linears)."""
+    """Local copy of apply_apb without the layer filter (we only have Linears)."""
     for name, mod in list(model.named_modules()):
         if isinstance(mod, nn.Linear):
             fim = fim_dict[name]

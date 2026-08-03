@@ -45,7 +45,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from qat import (evaluate, _Tee, compute_weight_dplr_fim,        # noqa: E402
-                 init_from_baseline)
+                 get_prunable_layers, init_from_baseline)
 from finetune import build_data                                  # noqa: E402
 from prune import prune_transformer                             # noqa: E402
 
@@ -177,8 +177,9 @@ def main():
               f'(importance={args.importance}) ...')
         t0 = time.time()
         fim = compute_weight_dplr_fim(model, train_loader, device,
+                                      get_prunable_layers(model),
                                       n_batches=args.fim_batches, fim_mode=args.importance,
-                                      scope='skip', full=args.importance_full)
+                                      full=args.importance_full)
         print(f'FIM done in {time.time()-t0:.1f}s, {len(fim)} layers')
 
     # ----- structural prune -----
