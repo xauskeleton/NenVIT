@@ -561,7 +561,6 @@ class DPLRBlockLoss(nn.Module):
 
     paper_loss=False restores the pre-2026-08-02 variant (G from CE, signed Δz, no
     /init_loss, rank frozen at k), kept only to reproduce older runs.
-    How this differs from FIMA-Q: DPLR_FIDELITY.md.
     """
     def __init__(self, model_fp: nn.Module, k: int = 5,
                  p1: float = 1.0, p2: float = 1.0,
@@ -991,7 +990,7 @@ def main():
     p.add_argument('--dplr-legacy-loss', action='store_true',
                    help='Restore the pre-2026-08-02 DPLR loss (G from CE, signed Δz, no '
                         '/init_loss, FIM frozen at rank k). Only for reproducing the '
-                        'older runs in runs/README.md; see DPLR_FIDELITY.md. '
+                        'older runs in runs/README.md. '
                         'Needs --dplr-lambda 3000.')
     p.add_argument('--dplr-temp', type=float, default=20.0,
                    help='KL temperature for the FIM measurement pass (FIMA-Q uses 20 '
@@ -1228,7 +1227,7 @@ def main():
                   f'rank {dplr.rank}→{args.dplr_rank}, calib={_cal_n} anh (co dinh)')
         else:
             print(f'DPLR loss: LEGACY path (G=CE, signed Δz, no /init_loss, FIM frozen '
-                  f'at rank {args.dplr_rank}) — see DPLR_FIDELITY.md')
+                  f'at rank {args.dplr_rank})')
         print(f'DPLR ready: {len(dplr.states)} transformer blocks tracked, '
               f'λ={args.dplr_lambda}, p1={args.dplr_p1}, p2={args.dplr_p2}')
 

@@ -78,8 +78,8 @@ Mỗi kiến trúc cần baseline riêng ở bước 1, không dùng chung đư�
 | `--no-amp` | | tắt mixed precision |
 | `--out-dir` | | **luôn đặt riêng cho mỗi run** — mặc định sẽ ghi đè |
 
-`--help` để xem hết. `DPLR_FIDELITY.md` mô tả DPLR loss và các cờ `--dplr-*` còn lại
-(`--dplr-temp`, `--dplr-rank`, `--dplr-calib-size`, `--dplr-legacy-loss` để tái lập run cũ).
+`--help` để xem hết — còn `--dplr-temp`, `--dplr-rank`, `--dplr-calib-size`, và
+`--dplr-legacy-loss` (khôi phục DPLR loss cũ, cần `--dplr-lambda 3000`).
 
 ---
 
@@ -124,6 +124,5 @@ Checkpoint, `data/`, `wandb/` nằm trong `.gitignore`.
 |---|---|
 | `runs/README.md` | bảng kết quả tổng hợp — **nguồn số chính thức** |
 | `ABLATIONS.md` | thiết kế + kết quả các ablation |
-| `DPLR_FIDELITY.md` | DPLR loss ở đây khác FIMA-Q gốc chỗ nào |
 
 Repo: https://github.com/xauskeleton/NenVIT
