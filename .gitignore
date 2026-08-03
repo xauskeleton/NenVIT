@@ -77,3 +77,9 @@ wandb/
 
 # checkpoint archives
 *.tar.gz
+
+# runner scripts: giu o local, khong version
+scripts/run_all3.sh
+scripts/run_ablation_*.sh
+scripts/status.sh
+scripts/backfill_wandb.py
