@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Ablation A1 + (A2×A3×act) cho Swin-S, CHUẨN HÓA về config train-thật:
-#   50ep · batch 64 · patience 15 · seed 3407 · br0.99 · DPLR λ3000
+#   50ep · batch 64 · patience 15 · seed 3407 · br0.99 · DPLR λ0.1
 # Chạy trên MODEL PRUNED (ckpt_swin/pruned/best_pruned_model.pt) — cùng base với
 # headline multi-arch, reuse được 2 ô đã có từ e2e:
 #   magnitude+DPLR+act1 = ckpt_swin/prune_quant_br0.99_act1 (52.47%)
@@ -26,7 +26,7 @@ BR="${BR:-0.99}"
 EPOCHS="${EPOCHS:-50}"
 BATCH="${BATCH:-64}"
 PATIENCE="${PATIENCE:-15}"
-DPLR_LAMBDA="${DPLR_LAMBDA:-3000}"
+DPLR_LAMBDA="${DPLR_LAMBDA:-0.1}"   # loss chuan hoa O(1) tu 2026-08-02 (ban cu: 3000)
 
 PRUNED="ckpt_swin/pruned/best_pruned_model.pt"          # fisher-0.5 (A1 arm 1, đã có)
 BASELINE="ckpt_swin/ft/best.pth"                         # FP baseline cho prune

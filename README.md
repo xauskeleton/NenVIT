@@ -1,124 +1,129 @@
-# NenVIT — APB + FIMA-Q QAT on Swin-S
 
-Nén Swin Transformer cho Tiny ImageNet bằng **APB binarization** ([arXiv:2306.08960](https://arxiv.org/abs/2306.08960)),
-chọn weight binary/FP bằng **DPLR-FIM importance** từ FIMA-Q ([arXiv:2506.11543](https://arxiv.org/abs/2506.11543)).
-QAT end-to-end với CE loss + optional DPLR distillation loss.
+# NenVIT — Nén Vision Transformer: Structural Pruning + APB Quantization
 
-**Novelty:** FIM-based mask thay magnitude, áp lần đầu cho Vision Transformer.
+Nén **Swin / DeiT / ViT** bằng hai hướng, cùng dựa trên Fisher Information:
 
-> ⛔ **DEPRECATED (2026-07-13):** `dplr`/`fim` cho **importance/partition** đã bỏ — chỉ dùng **`fisher`** (FIM
-> chuẩn) để rank. `dplr` (tự chế) chỉ còn trong **DPLR *loss*** (distillation), KHÔNG dùng ranking. README này
-> còn nhiều số/khái niệm cũ (Tiny ImageNet, dplr...) — tin `runs/README.md` + `ABLATIONS.md`.
+1. **Structural pruning** — bỏ attention head + MLP neuron theo empirical Fisher (`prune_cifar.py`)
+2. **APB quantization + QAT** — chia weight thành binary (`α·sign(w)`) và full-precision rồi
+   fine-tune, kèm distillation loss DPLR-FIM (`qat.py`)
 
-## Run
+Ghép được thành chuỗi **prune → finetune → quantize**.
+
+Paper nền: [APB](https://arxiv.org/abs/2306.08960) · [FIMA-Q](https://arxiv.org/abs/2506.11543) — PDF trong `pdf/`.
+
+---
+
+## Cài đặt
+
+Cần GPU NVIDIA. Đã test trên Python 3.10, torch 2.11 + CUDA 12.8, timm 1.0.27.
 
 ```bash
-# Quick test
-python apb_fimaq/qat.py --debug
+conda create -n fimaq_apb python=3.10 -y
+conda activate fimaq_apb
 
-# Full
-python apb_fimaq/qat.py --use-dplr-loss --dplr-lambda 3000
+# torch theo dung CUDA cua may -- xem https://pytorch.org/get-started/locally/
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
-# Hoặc launcher với preset config
-python apb_fimaq/run_full.py
+pip install -r requirements.txt
 ```
+
+```bash
+python -c "import torch, timm; print(torch.__version__, torch.cuda.is_available(), timm.__version__)"
+```
+
+**Dữ liệu:** CIFAR-100 tự tải về `./data` ở lần chạy đầu (~170 MB), không phải chuẩn bị gì.
+
+---
+
+## Chạy
+
+Chạy từ thư mục gốc của repo.
+
+```bash
+# 0) Smoke test (~1 phut)
+python apb_fimaq/qat.py --debug --dataset cifar100
+
+# 1) FP baseline -- bat buoc, moi kien truc mot baseline rieng
+python apb_fimaq/finetune.py --dataset cifar100 --epochs 20 --out-dir ckpt
+
+# 2) Structural pruning (bo ~50% head + MLP neuron)
+python apb_fimaq/prune_cifar.py --dataset cifar100 --baseline-ckpt ckpt/best.pth \
+    --importance fisher --rank-mode global --head-ratio 0.5 --mlp-ratio 0.5 \
+    --epochs 20 --out-dir ckpt/pruned
+
+# 3) APB quantization + QAT tren model da prune
+python apb_fimaq/qat.py --dataset cifar100 --init-model ckpt/pruned/best_pruned_model.pt \
+    --partition magnitude --binary-ratio 0.99 --use-dplr-loss --dplr-lambda 0.1 \
+    --epochs 30 --out-dir ckpt/prune_quant
+```
+
+Cả ba bước bằng một lệnh (tự bỏ qua bước đã xong):
+```bash
+MODEL=swin_small_patch4_window7_224 PY=python bash scripts/run_e2e.sh
+```
+
+Đổi kiến trúc bằng `--model` (`deit_small_patch16_224`, `vit_small_patch16_224`, …).
+Mỗi kiến trúc cần baseline riêng ở bước 1, không dùng chung được.
+
+### Cờ hay dùng
+
+| cờ | mặc định | |
+|---|---|---|
+| `--binary-ratio` | 0.75 | tỉ lệ weight bị binarize; 0.95–0.99 là vùng hay dùng |
+| `--partition` | `magnitude` | chọn weight giữ FP: `magnitude` hoặc `fisher` |
+| `--use-dplr-loss` | tắt | distillation loss per-block từ teacher FP (DPLR-FIM) |
+| `--dplr-lambda` | 0.1 | trọng số DPLR; loss đã chuẩn hóa về O(1) nên 0.1 là điểm cân |
+| `--act-bits` | 0 | lượng tử hóa activation (0 = tắt; 8/4/2/1) |
+| `--epochs` `--batch-size` `--lr` | 10 / 64 / 1e-4 | |
+| `--no-amp` | | tắt mixed precision |
+| `--out-dir` | | **luôn đặt riêng cho mỗi run** — mặc định sẽ ghi đè |
+
+`--help` để xem hết. `DPLR_FIDELITY.md` mô tả DPLR loss và các cờ `--dplr-*` còn lại
+(`--dplr-temp`, `--dplr-rank`, `--dplr-calib-size`, `--dplr-legacy-loss` để tái lập run cũ).
+
+---
+
+## APBLinear
+
+```python
+mask=True  →  α · sign(latent_weight)     # 1 bit
+mask=False →  latent_weight               # 32 bit
+```
+
+`α` học được (custom STE giữ gradient cho cả `latent_weight` lẫn `α`), đóng băng ở nửa chừng
+training. Mask cố định suốt run. Weight decay không áp lên `α`. Bọc toàn bộ 100 `nn.Linear`
+kể cả `head.fc` và `downsample`; chỉ bỏ `patch_embed` (Conv2d).
+
+`--export-packed` lưu thêm `best_packed.pt` theo định dạng Eq 10 của paper APB.
+
+---
 
 ## Cấu trúc
 
 ```
-NenVIT/
-├── apb_fimaq/qat.py            Main pipeline (self-contained ~600 LOC)
-├── apb_fimaq/run_full.py       Launcher 1-lệnh với preset
-├── scripts/tiny_imagenet_loader.py    Tiny ImageNet via HF
-└── *.pdf                       APB + FIMA-Q papers
+apb_fimaq/
+  qat.py            APB quantization + QAT (APBLinear, FIM, DPLR loss, packed export)
+  prune.py          thu vien cat head / MLP neuron
+  prune_cifar.py    driver: prune + finetune
+  finetune.py       tao FP baseline
+scripts/
+  cifar_loader.py   CIFAR-10/100 (32 -> 224 bicubic)
+  run_e2e.sh        chay ca 3 buoc
+runs/               log tung run + bang ket qua tong hop
+FIMA-Q/             repo goc, chi import -- khong sua
+pdf/                cac paper nen
 ```
 
-## Pipeline
-
-```
-1. Load Swin-S pretrained
-2. Compute DPLR-FIM(W) — k=5 batches forward+backward
-3. Apply APB: mask = (FIM < 75% percentile), wrap nn.Linear → APBLinear
-4. QAT 10-20 epochs: loss = CE + λ · Σ_blocks L_DPLR
-   - latent_weight + α học; mask FROZEN; freeze α ở epoch/2
-```
-
-## APB Linear
-
-```python
-binary zone (mask=True):  α · sign(latent_weight)    # 1 bit
-FP zone     (mask=False): latent_weight              # 32 bit
-```
-
-Backward: custom STE preserves cả `latent_weight` và `α` gradient.
-
-## Target layers
-
-- **`--apb-scope skip`** (default): 96 Linears (qkv/proj/fc1/fc2 × 24), skip head + downsample + patch_embed → 95.1% params
-- **`--apb-scope full`**: 100 Linears, thêm head.fc + downsample.reduction → 98.2%
-
-## Key CLI flags
-
-| Flag | Default | |
-|---|---|---|
-| `--binary-ratio` | 0.75 | % weights binarize |
-| `--apb-scope` | skip | skip (96) hoặc full (100) layers |
-| `--epochs` | 10 | QAT epochs |
-| `--lr` | 1e-4 | AdamW |
-| `--batch-size` | 64 | |
-| `--fim-batches` | 5 | k calib batches cho importance (+ rank k của DPLR loss) |
-| `--importance-full` | False | tính importance trên **toàn dataset** (1 pass, exact; nên dùng với `fisher`) |
-| `--logits-reversal` | False | LR (arXiv 2603.18596): dùng CE(-logit) khi tính importance, fix gradient-vanishing; trực giao với `--importance` (`fisher`+LR = Ω^LR của paper) |
-| `--importance` | fisher | ⛔ chỉ `fisher` (dplr đã bỏ; `--fim-mode` alias) |
-| `--use-dplr-loss` | False | DPLR distillation loss |
-| `--dplr-lambda` | 1.0 | Dùng **3000** (raw DPLR ~0.002 vs CE ~6) |
-| `--debug` | False | 2-epoch smoke test |
-
-## Design quan trọng
-
-- **Mask FROZEN** (không recompute) → stability. Verified: 0% mask flip, 0.25% sign flip.
-- **α learnable** với custom STE (paper Eq 8: `∂L/∂α = Σ grad·sign(w)·χ_binary`).
-- **Weight decay** chỉ áp lên weights, **KHÔNG áp lên α** (paper APB rule).
-- **DPLR-FIM** dùng 2 chỗ:
-  - Importance ranking (per-weight, 1 lần) → set mask
-  - Loss distillation (per-block per-batch) → guide gradient
-
-## Dataset
-
-Tiny ImageNet (200 classes 64×64) via HuggingFace `zh-plus/tiny-imagenet`.
-18 classes outside ImageNet-1k auto-filter → 182 classes mapped to 1000 indices → dùng head pretrained trực tiếp.
-
-## Setup
-
-```bash
-conda create -n fimaq_apb python=3.10 -y && conda activate fimaq_apb
-# Blackwell (RTX 50xx):
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-# Other GPUs (Kaggle, Ampere, ...):
-pip install torch torchvision
-pip install datasets timm
-```
-
-## Kaggle
-
-```python
-!git clone https://github.com/xauskeleton/NenVIT.git && cd NenVIT
-!pip install -q datasets timm
-!python apb_fimaq/qat.py --use-dplr-loss --dplr-lambda 3000 \
-    --batch-size 32 --out-dir /kaggle/working/qat
-```
-
-## Expected results
-
-| Stage | Top-1 Tiny val |
-|---|---|
-| FP baseline | 55.76% |
-| Post-APB (no train) | ~5% |
-| 2-ep debug | ~32% |
-| 20-ep target | **45-55%** |
-
-Paper FIMA-Q báo 81.82% Swin-S W4A4 trên full ImageNet-1k (task khác).
+Checkpoint, `data/`, `wandb/` nằm trong `.gitignore`.
 
 ---
+
+## Đọc thêm
+
+| file | nội dung |
+|---|---|
+| `runs/README.md` | bảng kết quả tổng hợp — **nguồn số chính thức** |
+| `ABLATIONS.md` | thiết kế + kết quả các ablation |
+| `DPLR_FIDELITY.md` | DPLR loss ở đây khác FIMA-Q gốc chỗ nào |
 
 Repo: https://github.com/xauskeleton/NenVIT

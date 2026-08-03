@@ -24,7 +24,7 @@ USAGE
     python qat.py --binary-ratio 0.85          # more aggressive
     python qat.py --fim-mode diag              # ablation: diag-only (faster, less accurate)
     python qat.py --fim-mode rank              # ablation: rank-k only
-    python qat.py --fim-p1 1.5 --fim-p2 0.5    # tune DPLR weights
+    python qat.py --dplr-p1 1.5 --dplr-p2 0.5  # tune rank:diag ratio
     python qat.py --debug                      # 1 epoch, k=1, smoke test
 
     # Quantize a PRUNED model (prune -> finetune -> APB-QAT). --init-model loads the
@@ -547,39 +547,54 @@ get_swin_blocks = get_transformer_blocks
 
 
 class DPLRBlockLoss(nn.Module):
-    """
-    Per-block DPLR-FIM loss for QAT.
+    """Per-block DPLR-FIM distillation loss (FIMA-Q) for QAT.
 
-    Initialization (once, after APB applied):
-      For each transformer block, collect k pairs of (Δz, ∇L) by running k batches of
-      forward+backward (CE loss) on the current APB model with FP teacher.
-      Store: G shape (k, N), D shape (k, N), inv_B shape (k, k), diag shape (N,).
+    Setup — initialize(), then refresh() once every epochs/k epochs: append one row of
+    (G, D) per block, G = mean|∇ at the block output|, D = mean|Δz|; rebuild inv_B.
 
-    During training (each batch):
-      Run FP teacher forward (no grad) to get z_fp_b per block.
-      Run APB model forward (with grad) to get z_apb_b per block (via hooks).
-      For each block b:
-        Δz_b = z_apb_b - z_fp_b                   shape (B, N)
-        L_diag(b)   = E_B[ Σ_n diag_b[n] · Δz_b[B,n]² ]
-        L_rank-k(b) = E_B[ (Δz_b · G_b^T) · inv_B_b · (G_b · Δz_b^T) ]
-        L_DPLR(b)   = p1·L_rank-k(b) + p2·L_diag(b)
-      Total = Σ_b L_DPLR(b)
+    Each batch:
+        Δz_b      = z_apb_b - z_fp_b                                    (B, N)
+        L_diag    = mean( Δz_b² · mean_k G_b )
+        L_rank-k  = mean( (|Δz_b|·G_bᵀ) · inv_B_b · (|Δz_b|·G_bᵀ)ᵀ )
+        L_DPLR(b) = p1·L_rank-k/init_rank_b + p2·L_diag/init_diag_b
+        total     = Σ_b L_DPLR(b)
+
+    paper_loss=False restores the pre-2026-08-02 variant (G from CE, signed Δz, no
+    /init_loss, rank frozen at k), kept only to reproduce older runs.
+    How this differs from FIMA-Q: DPLR_FIDELITY.md.
     """
     def __init__(self, model_fp: nn.Module, k: int = 5,
-                 p1: float = 1.0, p2: float = 1.0):
+                 p1: float = 1.0, p2: float = 1.0,
+                 paper_loss: bool = True, temperature: float = 20.0):
         super().__init__()
         self.model_fp = model_fp
         for p in self.model_fp.parameters():
             p.requires_grad = False
         self.model_fp.eval()
         self.k = k; self.p1 = p1; self.p2 = p2
+        self.paper_loss = paper_loss      # False = legacy path (--dplr-legacy-loss)
+        self.temperature = temperature    # KL temperature (FIMA-Q configs use 20)
 
-        # Filled by initialize()
+        # Filled by initialize() / measure()
         self.states: dict = {}            # name → {'G','D','inv_B','diag','N'}
+        self._G_rows: dict = {}           # name → list of (N,) rows; grows 1..k
+        self._D_rows: dict = {}
+        self._init_rank: dict = {}        # per-block /init_loss denominators
+        self._init_diag: dict = {}
         # Caches filled by hooks each forward
         self.z_apb_cache: dict = {}
         self.z_fp_cache: dict  = {}
+        self._blocks_apb: dict = {}
         self._installed = False
+        self._calib_iter = None           # legacy path only
+        self._paper_calib = None          # fixed calib subset, set by initialize()
+
+    @property
+    def rank(self) -> int:
+        """Current low-rank k' (grows 1→k when paper_loss refreshes)."""
+        for rows in self._G_rows.values():
+            return len(rows)
+        return 0
 
     def _make_cache_hook(self, cache, name):
         def hook(_m, _inp, out):
@@ -591,22 +606,40 @@ class DPLRBlockLoss(nn.Module):
         blocks_apb = get_transformer_blocks(model_apb)
         blocks_fp  = get_transformer_blocks(self.model_fp)
         assert set(blocks_apb) == set(blocks_fp), 'block names mismatch FP vs APB'
+        self._blocks_apb = blocks_apb
         for n, m in blocks_apb.items():
             m.register_forward_hook(self._make_cache_hook(self.z_apb_cache, n))
         for n, m in blocks_fp.items():
             m.register_forward_hook(self._make_cache_hook(self.z_fp_cache, n))
+        self._G_rows = {n: [] for n in blocks_apb}
+        self._D_rows = {n: [] for n in blocks_apb}
         self._installed = True
 
     def clear_caches(self):
         self.z_apb_cache.clear()
         self.z_fp_cache.clear()
 
-    def initialize(self, model_apb: nn.Module, calib_loader, device):
-        """Collect k FIM samples per block (paper-style, Section 3.3)."""
-        self.install_hooks(model_apb)
-        blocks_apb = get_transformer_blocks(model_apb)
+    def _delta_z(self, name):
+        """Δz for one block, (B, N). Taken from the natural forward so the gradient
+        flows back through the preceding blocks too — unlike FIMA-Q, whose stored block
+        inputs carry no graph because it reconstructs blocks one at a time."""
+        z_a = self.z_apb_cache[name]
+        z_f = self.z_fp_cache[name].detach()
+        B = z_f.shape[0]
+        return z_a.reshape(B, -1).float() - z_f.reshape(B, -1).float()
 
-        # Backward hooks to capture gradient at block output
+    def measure(self, model_apb: nn.Module, batches, device):
+        """Append ONE (G, D) row per block, averaged over `batches`, and rebuild inv_B.
+        Nothing is optimised — the backward only exists so the hooks see the gradient.
+
+        `batches` is the FIXED calib subset, re-walked identically on every refresh, so
+        successive rows differ only because the model moved (paper, after Eq 17).
+
+        The measurement loss sets what G estimates: KL(p_FP ‖ p_APB) at temperature T,
+        which is what licenses the first-order |g| weighting (Theorem 3.2: ∇L_KL = F·Δz).
+        Legacy uses CE against the labels instead, for which only g² would be justified.
+        """
+        blocks_apb = self._blocks_apb
         grad_cache = {}
         bwd_hooks = []
         for name, m in blocks_apb.items():
@@ -617,74 +650,125 @@ class DPLRBlockLoss(nn.Module):
                 return h
             bwd_hooks.append(m.register_full_backward_hook(make_bwd(name)))
 
-        G_lists = {n: [] for n in blocks_apb}
-        D_lists = {n: [] for n in blocks_apb}
-
         crit = nn.CrossEntropyLoss()
-        it = iter(calib_loader)
-        for _ in range(self.k):
-            try:
-                x, y = next(it)
-            except StopIteration:
-                it = iter(calib_loader); x, y = next(it)
+        g_sum = {n: None for n in blocks_apb}
+        d_sum = {n: None for n in blocks_apb}
+        seen = 0
+        for x, y in batches:
             x = x.to(device); y = y.to(device)
 
             self.clear_caches(); grad_cache.clear()
             with torch.no_grad():
-                _ = self.model_fp(x)
+                logits_fp = self.model_fp(x)
             model_apb.zero_grad()
             logits = model_apb(x)
-            loss = crit(logits, y)
+            if self.paper_loss:
+                t = self.temperature
+                loss = F.kl_div(F.log_softmax(logits / t, dim=-1),
+                                F.softmax(logits_fp / t, dim=-1),
+                                reduction='batchmean')
+            else:
+                loss = crit(logits, y)
             loss.backward()
 
-            for name in blocks_apb:
-                if name not in grad_cache: continue
-                z_a = self.z_apb_cache[name].detach()
-                z_f = self.z_fp_cache[name].detach()
-                g = grad_cache[name]
-                B = z_a.shape[0]
-                d = (z_a.reshape(B, -1) - z_f.reshape(B, -1)).abs().float().mean(dim=0)
-                gv = g.reshape(B, -1).abs().float().mean(dim=0)
-                G_lists[name].append(gv.cpu()); D_lists[name].append(d.cpu())
+            with torch.no_grad():
+                for name in blocks_apb:
+                    if name not in grad_cache: continue
+                    g = grad_cache[name]
+                    B = g.shape[0]
+                    gv = g.reshape(B, -1).abs().float().mean(dim=0)
+                    d  = self._delta_z(name).abs().mean(dim=0)
+                    g_sum[name] = gv if g_sum[name] is None else g_sum[name] + gv
+                    d_sum[name] = d  if d_sum[name] is None else d_sum[name] + d
+            seen += 1
 
         for h in bwd_hooks: h.remove()
         model_apb.zero_grad()
         self.clear_caches()
 
-        for name in list(blocks_apb):
-            if not G_lists[name]: continue
-            G = torch.stack(G_lists[name], dim=0).to(device)          # (k, N)
-            D = torch.stack(D_lists[name], dim=0).to(device)          # (k, N)
-            DD = D @ D.T                                              # (k, k)
-            inv_B = torch.linalg.inv(DD + 1e-6 * torch.eye(self.k, device=device))
+        for name in blocks_apb:
+            if g_sum[name] is None: continue
+            self._G_rows[name].append((g_sum[name] / seen).to(device))
+            self._D_rows[name].append((d_sum[name] / seen).to(device))
+            G = torch.stack(self._G_rows[name], dim=0)                # (k', N)
+            D = torch.stack(self._D_rows[name], dim=0)                # (k', N)
+            r = G.shape[0]
+            inv_B = torch.linalg.inv(D @ D.T + 1e-6 * torch.eye(r, device=device))
             self.states[name] = {
                 'G': G, 'D': D, 'inv_B': inv_B,
                 'diag': G.mean(dim=0),    # (N,)
                 'N': G.shape[1],
             }
+        if self.paper_loss:
+            # FIMA-Q re-normalises init_loss on every refresh (block_recon.py:461)
+            self._init_rank.clear(); self._init_diag.clear()
+
+    def initialize(self, model_apb: nn.Module, calib_loader, device,
+                   paper_calib_loader=None):
+        """Build the initial FIM state. paper_loss starts at rank 1 and refresh() grows
+        it to k (FIMA-Q Eq 17); legacy takes k single-batch snapshots then freezes."""
+        self.install_hooks(model_apb)
+        self._paper_calib = paper_calib_loader if paper_calib_loader is not None \
+            else calib_loader
+
+        if self.paper_loss:
+            self.measure(model_apb, self._paper_calib, device)
+        else:
+            def _cycle():
+                while True:
+                    for batch in calib_loader:
+                        yield batch
+            self._calib_iter = _cycle()
+            for _ in range(self.k):
+                self.measure(model_apb, [next(self._calib_iter)], device)
+
+    def refresh(self, model_apb: nn.Module, device):
+        """Append one more rank (FIMA-Q new_fisher_ro). No-op once rank == k."""
+        if not self.paper_loss or self.rank >= self.k:
+            return False
+        was_training = model_apb.training
+        model_apb.eval()
+        self.measure(model_apb, self._paper_calib, device)
+        if was_training:
+            model_apb.train()
+        return True
 
     def compute(self) -> torch.Tensor:
-        """Sum L_DPLR over all blocks for current batch (caches must be populated)."""
+        """Sum L_DPLR over all blocks for current batch (caches must be populated).
+        Forced to fp32: the caller runs under autocast but L_rank lands near 1e-10,
+        which fp16 cannot represent. Negligible cost next to the block forwards."""
         device = next(self.model_fp.parameters()).device
+        with torch.amp.autocast('cuda', enabled=False):
+            return self._compute_fp32(device)
+
+    def _compute_fp32(self, device) -> torch.Tensor:
         total = torch.tensor(0.0, device=device)
         if not self.states:
             return total
         for name, s in self.states.items():
             if name not in self.z_apb_cache or name not in self.z_fp_cache:
                 continue
-            z_a = self.z_apb_cache[name]
-            z_f = self.z_fp_cache[name].detach()
-            B = z_a.shape[0]
-            cha = (z_a.reshape(B, -1) - z_f.reshape(B, -1)).float()    # (B, N)
+            cha = self._delta_z(name)                                   # (B, N)
 
-            # L_diag (paper Eq 14, simplified)
+            # Eq 14 (the released code drops paper's /Δz factor; measured equivalent)
             L_diag = (cha.pow(2) * s['diag'].unsqueeze(0)).mean()
 
-            # L_rank-k (paper Eq 18)
-            A = cha @ s['G'].T                                          # (B, k)
+            # Eq 18. |Δz| per block_recon.py:457 — with a signed Δz the per-channel
+            # terms cancel against the all-positive G and the rank term collapses.
+            c = cha.abs() if self.paper_loss else cha
+            A = c @ s['G'].T                                            # (B, k')
             L_rank = (A.unsqueeze(1) @ s['inv_B'] @ A.unsqueeze(-1)).squeeze(-1).squeeze(-1).mean()
 
-            total = total + self.p1 * L_rank + self.p2 * L_diag
+            if self.paper_loss:
+                # Per-block /init_loss (block_recon.py:461-465): without it the two
+                # terms sit orders of magnitude apart and λ has to absorb the scale.
+                if name not in self._init_rank:
+                    self._init_rank[name] = L_rank.detach().clamp_min(1e-30)
+                    self._init_diag[name] = L_diag.detach().clamp_min(1e-30)
+                total = total + (self.p1 * L_rank / self._init_rank[name]
+                                 + self.p2 * L_diag / self._init_diag[name])
+            else:
+                total = total + self.p1 * L_rank + self.p2 * L_diag
         return total
 
 
@@ -875,23 +959,20 @@ def main():
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--fim-batches', type=int, default=5,
-                   help='Number of calib batches (= rank k) for FIM extraction (default 5). '
-                        'Also serves as rank k for the DPLR distillation loss.')
+                   help='Calib batches for the APB-partition FIM pass, i.e. only used '
+                        "with --partition fisher (default 5). The DPLR loss has its own "
+                        '--dplr-rank and --dplr-calib-size.')
     p.add_argument('--importance-full', action='store_true',
                    help='Compute the APB-partition importance over the ENTIRE dataset '
                         '(one full pass) instead of --fim-batches calibration batches. '
-                        'For exact importance with no sampling error (recommended with '
-                        "--importance fisher). Independent of --fim-batches, which still "
-                        'sets rank k for the DPLR loss.')
-    p.add_argument('--importance', '--fim-mode', dest='importance', type=str,
-                   default='fisher', choices=['fisher'],
-                   help="FIM variant for partition='fisher'. Only 'fisher' (exact empirical Fisher) — "
-                        "the self-devised 'dplr' variant was removed 2026-07-13. Ignored when "
-                        "partition=magnitude. (The DPLR distillation loss builds its own FIM, independent.)")
-    p.add_argument('--fim-p1', type=float, default=1.0,
-                   help='Weight for rank-k (L2) component in DPLR (default 1.0)')
-    p.add_argument('--fim-p2', type=float, default=1.0,
-                   help='Weight for diag (L1) component in DPLR (default 1.0)')
+                        'For exact importance with no sampling error.')
+    p.add_argument('--dplr-p1', '--fim-p1', dest='dplr_p1', type=float, default=1.0,
+                   help='Weight of the rank-k term in L_DPLR (default 1.0). After the '
+                        'per-block /init_loss normalisation this really is the rank:diag '
+                        'ratio. (--fim-p1 kept as alias.)')
+    p.add_argument('--dplr-p2', '--fim-p2', dest='dplr_p2', type=float, default=1.0,
+                   help='Weight of the diagonal term in L_DPLR (default 1.0). '
+                        '(--fim-p2 kept as alias.)')
 
     # Dynamic mask refresh
     p.add_argument('--recompute-fim-every', type=int, default=0,
@@ -903,9 +984,25 @@ def main():
     p.add_argument('--use-dplr-loss', action='store_true',
                    help='Add per-block DPLR-FIM loss (knowledge distillation from FP teacher) '
                         'during QAT. Doubles memory (FP model in RAM) but tighter accuracy.')
-    p.add_argument('--dplr-lambda', type=float, default=1.0,
-                   help='Weight for DPLR loss vs CE loss (default 1.0). '
-                        'total = CE + lambda · Σ_blocks L_DPLR')
+    p.add_argument('--dplr-lambda', type=float, default=0.1,
+                   help='Weight for DPLR loss vs CE loss. total = CE + lambda · Σ_b '
+                        'L_DPLR. Default 0.1 suits the normalised (O(1)) loss; the '
+                        '--dplr-legacy-loss scale needs ~3000 instead.')
+    p.add_argument('--dplr-legacy-loss', action='store_true',
+                   help='Restore the pre-2026-08-02 DPLR loss (G from CE, signed Δz, no '
+                        '/init_loss, FIM frozen at rank k). Only for reproducing the '
+                        'older runs in runs/README.md; see DPLR_FIDELITY.md. '
+                        'Needs --dplr-lambda 3000.')
+    p.add_argument('--dplr-temp', type=float, default=20.0,
+                   help='KL temperature for the FIM measurement pass (FIMA-Q uses 20 '
+                        'for every bit-width). Ignored with --dplr-legacy-loss.')
+    p.add_argument('--dplr-rank', type=int, default=5,
+                   help='Rank k of the low-rank FIM term; grows 1→k, one step every '
+                        'epochs/k epochs (FIMA-Q Eq 17, their configs use k=5).')
+    p.add_argument('--dplr-calib-size', type=int, default=1024,
+                   help='Size of the FIXED calib subset each FIM row averages over, so '
+                        'rows differ only because the model moved (FIMA-Q uses 1024). '
+                        'Ignored with --dplr-legacy-loss.')
     p.add_argument('--dataset', choices=['tiny', 'imagenet1k', 'cifar10', 'cifar100'],
        default='tiny',
                    help='"tiny" (default) = HF tiny-imagenet, 91k/9.1k after IN-1k remap, '
@@ -953,6 +1050,8 @@ def main():
 
     if args.debug:
         args.epochs = 2; args.fim_batches = 1; args.batch_size = 32; args.num_workers = 0
+        args.dplr_rank = 1
+        args.dplr_calib_size = 64       # keep the DPLR FIM pass tiny in debug
         args.importance_full = False   # keep debug fast (no full-dataset importance pass)
         # 2 epochs so recompute-fim-every=1 can be tested if user passes it
 
@@ -1009,6 +1108,14 @@ def main():
     calib_loader = torch.utils.data.DataLoader(
         g.train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers)
+    # Fixed calib subset for the DPLR FIM. Kept separate from calib_loader, which must
+    # stay the full training set because --importance-full walks all of it.
+    _cal_g = torch.Generator().manual_seed(args.seed)
+    _cal_n = min(args.dplr_calib_size, len(g.train_set))
+    _cal_idx = torch.randperm(len(g.train_set), generator=_cal_g)[:_cal_n].tolist()
+    dplr_calib_loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(g.train_set, _cal_idx),
+        batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # ----- Model -----
     if args.init_model:
@@ -1056,13 +1163,11 @@ def main():
     if need_fim:
         over = ('the FULL dataset' if args.importance_full
                 else f'{args.fim_batches} calib batches')
-        print(f'Computing {args.importance.upper()}-FIM(W) over {over} '
-              f"(p1={args.fim_p1}, p2={args.fim_p2}) [for partition='fisher'] ...")
+        print(f"Computing FISHER-FIM(W) over {over} [for partition='fisher'] ...")
         t0 = time.time()
         fim_dict = compute_weight_dplr_fim(model, calib_loader, device,
                                             n_batches=args.fim_batches,
-                                            p1=args.fim_p1, p2=args.fim_p2,
-                                            fim_mode=args.importance,
+                                            fim_mode='fisher',
                                             scope='full',
                                             full=args.importance_full)
         print(f'FIM done in {time.time()-t0:.1f}s, {len(fim_dict)} layers (scope=full)')
@@ -1104,11 +1209,28 @@ def main():
                                          num_classes=num_classes)
             init_from_baseline(model_fp, args.baseline_ckpt or None)  # teacher matches student's init
         model_fp.to(device).eval()
-        dplr = DPLRBlockLoss(model_fp, k=args.fim_batches,
-                             p1=args.fim_p1, p2=args.fim_p2)
-        dplr.initialize(model, calib_loader, device)
+        paper_loss = not args.dplr_legacy_loss
+        if paper_loss and args.dplr_lambda > 10:
+            print(f'  !! WARNING: --dplr-lambda={args.dplr_lambda} is on the legacy scale. '
+                  f'The loss is normalised to O(1) now — use ~0.1 or DPLR will swamp CE.')
+        if args.dplr_legacy_loss and args.dplr_lambda < 100:
+            print(f'  !! WARNING: --dplr-legacy-loss with --dplr-lambda={args.dplr_lambda}. '
+                  f'The un-normalised loss is ~1e-3, so this is effectively CE-only '
+                  f'(legacy recipe is 3000).')
+        dplr = DPLRBlockLoss(model_fp, k=args.dplr_rank,
+                             p1=args.dplr_p1, p2=args.dplr_p2,
+                             paper_loss=paper_loss,
+                             temperature=args.dplr_temp)
+        dplr.initialize(model, calib_loader, device,
+                        paper_calib_loader=dplr_calib_loader)
+        if paper_loss:
+            print(f'DPLR loss: G=KL(T={args.dplr_temp:g}), |Δz|, per-block /init_loss, '
+                  f'rank {dplr.rank}→{args.dplr_rank}, calib={_cal_n} anh (co dinh)')
+        else:
+            print(f'DPLR loss: LEGACY path (G=CE, signed Δz, no /init_loss, FIM frozen '
+                  f'at rank {args.dplr_rank}) — see DPLR_FIDELITY.md')
         print(f'DPLR ready: {len(dplr.states)} transformer blocks tracked, '
-              f'λ={args.dplr_lambda}, p1={args.fim_p1}, p2={args.fim_p2}')
+              f'λ={args.dplr_lambda}, p1={args.dplr_p1}, p2={args.dplr_p2}')
 
     # ----- QAT -----
     # Paper APB convention: weight_decay applies to weights/bias only, NOT to α.
@@ -1161,8 +1283,7 @@ def main():
             if args.partition == 'fisher':
                 fim_new = compute_weight_dplr_fim(model, calib_loader, device,
                                                   n_batches=args.fim_batches,
-                                                  p1=args.fim_p1, p2=args.fim_p2,
-                                                  fim_mode=args.importance,
+                                                  fim_mode='fisher',
                                                   scope='full',
                                                   full=args.importance_full)
             n_upd, flip_pct = update_masks_from_fim(model, fim_new, args.binary_ratio,
@@ -1170,6 +1291,17 @@ def main():
                                                      partition=args.partition)
             print(f'  >> Epoch {ep+1}: refreshed mask [{args.partition}] ({n_upd} layers, '
                   f'{flip_pct:.1f}% positions flipped) in {time.time()-t_fim:.1f}s')
+
+        # Grow the low-rank basis 1→k across the run (FIMA-Q new_fisher_ro): each row is
+        # a different point on the trajectory, which is what makes them independent.
+        if dplr is not None and dplr.paper_loss and ep > 0:
+            every = max(1, args.epochs // max(args.dplr_rank, 1))
+            if ep % every == 0 and dplr.rank < args.dplr_rank:
+                t_r = time.time()
+                if dplr.refresh(model, device):
+                    print(f'  >> Epoch {ep+1}: DPLR FIM refreshed, '
+                          f'rank={dplr.rank}/{args.dplr_rank} '
+                          f'({time.time()-t_r:.1f}s)')
 
         if ep == freeze_at:
             for m in model.modules():

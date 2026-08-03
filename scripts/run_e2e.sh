@@ -4,7 +4,7 @@
 # (magnitude partition + DPLR distillation), on CIFAR-100.
 #
 # Chạy full cho MỘT model (Swin hoặc ViT/DeiT). Dùng đúng default đã chốt:
-#   prune  --importance fisher   |   qat --partition magnitude   |   DPLR λ=3000
+#   prune  --importance fisher   |   qat --partition magnitude   |   DPLR λ=0.1
 #
 # USAGE (mọi tham số qua biến môi trường, có default):
 #   bash scripts/run_e2e.sh                       # Swin-S (tái dùng ckpt/best_swin.pth)
@@ -35,7 +35,8 @@ RANK_MODE="${RANK_MODE:-global}"
 # quant knobs (magnitude + scope=full là default trong qat.py)
 BR="${BR:-0.95}"
 ACT_BITS="${ACT_BITS:-2}"
-DPLR_LAMBDA="${DPLR_LAMBDA:-3000}"
+DPLR_LAMBDA="${DPLR_LAMBDA:-0.1}"   # loss da chuan hoa O(1) tu 2026-08-02; ban cu can 3000
+QTAG="${QTAG:-}"                    # hau to out-dir, de khong de len ket qua cu
 # training
 FT_EPOCHS="${FT_EPOCHS:-50}"
 PRUNE_EPOCHS="${PRUNE_EPOCHS:-50}"
@@ -63,9 +64,17 @@ echo " quant: scope=full br=$BR act=$ACT_BITS dplr_lambda=$DPLR_LAMBDA"
 echo " quick=${QUICK:-0}"
 echo "=============================================================="
 
+PRUNED="$OUT/pruned/best_pruned_model.pt"
+# Stage 1 chỉ phục vụ Stage 2. Có pruned model rồi thì cả hai đều thừa — đừng
+# finetune 50 epoch chỉ để rồi vứt đi (đúng bẫy đã dính khi server bị xoá sạch).
+SKIP_FT_PRUNE=0
+if [ "${FORCE:-0}" != "1" ] && [ -f "$PRUNED" ]; then SKIP_FT_PRUNE=1; fi
+
 # ---- Stage 1: FP baseline (auto-skip nếu đã có; FORCE=1 để chạy lại) ----
 BASELINE="${BASELINE:-}"
-if [ -z "$BASELINE" ]; then
+if [ "$SKIP_FT_PRUNE" = "1" ]; then
+  echo ">> Stage 1 SKIP — không cần baseline, đã có pruned model"
+elif [ -z "$BASELINE" ]; then
   if [ "$MODEL" = "swin_small_patch4_window7_224" ] && [ -f ckpt/best_swin.pth ]; then
     BASELINE="ckpt/best_swin.pth"
     echo ">> Stage 1 SKIP — tái dùng baseline Swin có sẵn: $BASELINE"
@@ -82,8 +91,7 @@ if [ -z "$BASELINE" ]; then
 fi
 
 # ---- Stage 2: structural prune (fisher) — auto-skip nếu pruned model đã có ----
-PRUNED="$OUT/pruned/best_pruned_model.pt"
-if [ "${FORCE:-0}" != "1" ] && [ -f "$PRUNED" ]; then
+if [ "$SKIP_FT_PRUNE" = "1" ]; then
   echo ">> Stage 2 SKIP — pruned model đã có: $PRUNED  (FORCE=1 để chạy lại)"
 else
   echo ">> Stage 2: prune (fisher, $RANK_MODE) -> $PRUNED"
@@ -98,7 +106,12 @@ fi
 # ---- Stage 3: APB-QAT trên model đã prune (magnitude + DPLR) ----
 # out-dir gồm br/act → chạy e2e nhiều lần với BR/ACT khác nhau KHÔNG đè nhau
 # (baseline+prune auto-skip vì đã có; chỉ quant chạy lại → 1 prune, nhiều quant).
-QOUT="$OUT/prune_quant_br${BR}_act${ACT_BITS}"
+QOUT="$OUT/prune_quant_br${BR}_act${ACT_BITS}${QTAG}"
+if [ -f "$QOUT/best.pth" ] && [ "${FORCE:-0}" != "1" ]; then
+  echo ">> Stage 3 SKIP — da co: $QOUT/best.pth  (FORCE=1 de chay lai)"
+  grep -ah "DONE. Best val top1" "$QOUT/train.log" 2>/dev/null || true
+  exit 0
+fi
 echo ">> Stage 3: APB-QAT (magnitude+DPLR) -> $QOUT/best.pth"
 "$PY" apb_fimaq/qat.py --model "$MODEL" --dataset "$DATASET" \
   --init-model "$PRUNED" \

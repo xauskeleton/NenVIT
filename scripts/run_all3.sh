@@ -19,6 +19,8 @@
 set -euo pipefail
 
 export BATCH="${BATCH:-64}"
+export QTAG="${QTAG:-}"              # hau to out-dir; dat de khong de len ket qua cu
+export DPLR_LAMBDA="${DPLR_LAMBDA:-0.1}"
 export PYTHONUTF8=1
 # export QAT_EPOCHS=30   # <-- bỏ comment nếu muốn hạ QAT xuống 30ep cho nhanh (~40% giờ quant)
 
@@ -37,13 +39,14 @@ for M in "${MODELS[@]}"; do
   first=1
   for c in $CONFIGS; do
     BR="${c%:*}"; ACT="${c#*:}"
-    echo ">>> $M | br=$BR act=$ACT (first=$first)"
-    if [ "$first" = "1" ]; then
-      # lần đầu: redo finetune + prune (config mới) rồi quant
+    echo ">>> $M | br=$BR act=$ACT"
+    # Không FORCE: baseline + prune đã có sẵn và KHÔNG phụ thuộc DPLR loss,
+    # chạy lại chỉ tốn hàng chục giờ mà ra đúng số cũ (cùng seed).
+    # REDO_PRUNE=1 nếu thật sự muốn dựng lại từ đầu.
+    if [ "${REDO_PRUNE:-0}" = "1" ] && [ "$first" = "1" ]; then
       FORCE=1 MODEL="$M" BR="$BR" ACT_BITS="$ACT" bash scripts/run_e2e.sh
       first=0
     else
-      # các lần sau: tái dùng baseline+prune vừa tạo, chỉ chạy quant
       MODEL="$M" BR="$BR" ACT_BITS="$ACT" bash scripts/run_e2e.sh
     fi
   done

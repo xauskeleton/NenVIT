@@ -2,7 +2,7 @@
 # =============================================================================
 # Ablation QAT (A2×A3×act) cho Swin-S — CHỈ CHẠY QAT, KHÔNG prune.
 #   Lưới = partition{magnitude,fisher} × DPLR{on,off} × act{1,2} = 2×2×2 = 8 ô.
-#   Config train-thật: 50ep · batch 64 · patience 15 · seed 3407 · br0.99 · DPLR λ3000.
+#   Config train-thật: 50ep · batch 64 · patience 15 · seed 3407 · br0.99 · DPLR λ0.1.
 #   Base = model pruned SẴN CÓ (ckpt_swin/pruned = fisher-0.5) — chỉ ĐỌC, không ghi.
 #
 # AN TOÀN FILE: chỉ ghi vào ckpt_swin/ablation/qat_*  — KHÔNG đụng
@@ -26,7 +26,7 @@ BR="${BR:-0.99}"
 EPOCHS="${EPOCHS:-50}"
 BATCH="${BATCH:-64}"
 PATIENCE="${PATIENCE:-15}"
-DPLR_LAMBDA="${DPLR_LAMBDA:-3000}"
+DPLR_LAMBDA="${DPLR_LAMBDA:-0.1}"   # loss chuan hoa O(1) tu 2026-08-02 (ban cu: 3000)
 
 PRUNED="ckpt_swin/pruned/best_pruned_model.pt"   # fisher-0.5, base chung — CHỈ ĐỌC
 ABL="ckpt_swin/ablation"
