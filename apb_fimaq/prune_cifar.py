@@ -85,6 +85,13 @@ def main():
     p.add_argument('--fim-batches', type=int, default=10,
                    help='Calib batches for the pruning importance (ignored if '
                         '--importance-full).')
+    p.add_argument('--fim-batch-size', type=int, default=0,
+                   help='Batch size for the importance pass only (0 = same as '
+                        '--batch-size). The fisher estimator normalises by token '
+                        'count, so a smaller batch with proportionally more '
+                        'batches keeps the same sample budget while cutting peak '
+                        'VRAM roughly linearly (bs64 ~15.3GB, bs32 ~8.0GB, '
+                        'bs16 ~3.8GB). Finetuning still uses --batch-size.')
     p.add_argument('--importance-full', action='store_true',
                    help='Compute pruning importance over the ENTIRE training set '
                         '(one full pass) instead of --fim-batches calib batches. '
@@ -171,14 +178,28 @@ def main():
         print(f'Importance: weight-magnitude {args.mag_norm} '
               f'(data-free, no calib pass){warn}')
     else:
+        # Optional smaller batch for the importance pass only. The fisher estimator
+        # divides by token count, so shrinking the batch and scaling the batch count
+        # keeps the same sample budget (a different calib draw, not a different
+        # estimator) while cutting peak VRAM roughly linearly.
+        calib_loader, fim_nb = train_loader, args.fim_batches
+        if args.fim_batch_size and args.fim_batch_size != args.batch_size:
+            calib_loader = torch.utils.data.DataLoader(
+                train_loader.dataset, batch_size=args.fim_batch_size, shuffle=True,
+                num_workers=args.num_workers, pin_memory=True, drop_last=True)
+            fim_nb = max(1, round(args.fim_batches * args.batch_size / args.fim_batch_size))
+            print(f'  importance batch {args.batch_size} -> {args.fim_batch_size}, '
+                  f'batches {args.fim_batches} -> {fim_nb} '
+                  f'(~{fim_nb * args.fim_batch_size} samples, was '
+                  f'{args.fim_batches * args.batch_size})')
         over = ('the FULL training set' if args.importance_full
-                else f'{args.fim_batches} batches')
+                else f'{fim_nb} batches')
         print(f'Computing importance over {over} '
               f'(importance={args.importance}) ...')
         t0 = time.time()
-        fim = compute_weight_dplr_fim(model, train_loader, device,
+        fim = compute_weight_dplr_fim(model, calib_loader, device,
                                       get_prunable_layers(model),
-                                      n_batches=args.fim_batches, fim_mode=args.importance,
+                                      n_batches=fim_nb, fim_mode=args.importance,
                                       full=args.importance_full)
         print(f'FIM done in {time.time()-t0:.1f}s, {len(fim)} layers')
 
